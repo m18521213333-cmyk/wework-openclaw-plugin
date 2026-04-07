@@ -1,0 +1,44 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WTransport.proto";
+
+message ConversationPushNoticeMessage {
+    int64 WxId = 1; // 设备企业WX号
+    repeated ConversationMessage Convers = 2; // 好友信息模型 多个
+    int32 Size = 3;
+    int32 Count = 4;
+    int32 Page = 5;
+}
+
+message ConversationMessage {
+    int64 Id = 1; //
+    int64 RemoteId = 2; // 单聊=联系人RemoteId, 群聊=公司id，部门id或其他
+    string Name = 3;
+    string Avatar = 4;
+    int32 Type = 5; // 0 单聊 1 群聊
+    int64 Creator = 6; //创建者id
+    int64 CreateTime = 7; //创建时间
+    int64 UpdateTime = 8; // 最后更新时间
+    bool Notified = 9; // 是否新消息提示
+    int32 Flag = 10; // &2 全员群 &32 部门群
+    int32 UnreadCnt = 11; //未读消息数
+    string Notice = 12; // 群公告
+    string Digest = 13; // 最新消息概要
+    repeated ConvMemberMessage Members = 14; // 群成员
+    repeated int64 Admins = 15; // 群管理员
+    bool HasExternMember = 16; // 是否有外部联系人（外部群）
+    repeated string AvatarList = 17; // 群聊头像列表，9宫格
+    bool isSaved = 18; // 是否保存的群聊
+    bool isMarked = 19; // 是否标注
+    bool isTop = 20; // 是否置顶
+}
+
+message ConvMemberMessage {
+    int64 RemoteId = 1; // 群成员id
+    string Name = 2; // todo:暂时取不到
+    int64 JoinTime = 3;
+    int32 JoinScene = 4; // 加入场景，数值待确定
+    string Avatar = 5; // 头像 todo:暂时取不到
+    int64 CorpId = 6; // 公司id
+    int64 OpRemoteId = 7; // 邀请人id
+}

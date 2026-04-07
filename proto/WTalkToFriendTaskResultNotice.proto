@@ -1,0 +1,15 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+import "WTransport.proto";
+message TalkToFriendTaskResultNoticeMessage {
+    int64 WxId = 1; // 设备企业WX号
+    bool Success = 2; // 是否成功
+    EnumErrorCode Code = 3; // 错误码 Success = true 忽略
+    string ErrMsg = 4; // 错误内容描述 获取 成功时附带的结果内容
+    int64 TaskId = 5; // 业务的id,通用的。
+    int64 ConvId = 6; // 会话 RemoteId
+    int64 MsgId = 7; // 消息id
+    int64 MsgRemoteId = 8; // 消息RemoteId
+    int64 CreateTime = 9; // 消息发送时间
+}

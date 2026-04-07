@@ -1,0 +1,9 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message AddCustomerByIdTaskMessage {
+    int64 WxId = 1; //
+    repeated string Ids = 2; // 微信好友OpenId列表
+    string Msg = 3; // 招呼语，缺省：你好这是我的企业微信，以后也可以在这里与我联系。
+    int64 TaskId = 5;
+}

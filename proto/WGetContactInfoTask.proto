@@ -1,0 +1,8 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message GetContactInfoTaskMessage {
+    int64 WxId = 1; // 设备企业WX号
+    int64 RemoteId = 2; // 联系人id
+}
+

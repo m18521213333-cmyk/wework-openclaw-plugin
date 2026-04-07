@@ -1,0 +1,10 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message ForwardMsgTaskMessage {
+    int64 WxId = 1; // 设备企业WX号
+    int64 MsgId = 2; // 消息remoteid
+    int64 ConvId = 3; // 会话remoteid
+    int64 TaskId = 4; //任务id 在TaskResult中回传
+}
+

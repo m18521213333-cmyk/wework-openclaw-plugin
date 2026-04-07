@@ -1,0 +1,14 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+import "WTransport.proto";
+message DownloadFileResultNoticeMessage {
+    int64 WxId = 1; // 设备企业WX号
+    bool Success = 2; // 是否成功
+    string ErrMsg = 3; // 错误内容描述 获取 成功时附带的结果内容
+    string OrgUrl = 4; // 原始URL
+    string Url = 5; //
+    int32 FileType = 6; // 文件类型；1 大图  4 语音 5 视频 6 文件
+    int64 TaskId = 7; // 业务的id,通用的。
+    int64 MsgId = 8; // 消息唯一id
+}

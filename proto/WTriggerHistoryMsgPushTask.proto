@@ -1,0 +1,9 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message TriggerHistoryMsgPushTaskMessage {
+    int64 WxId = 1; //
+    int64 ConvId = 2; // 会话RemoteId
+    int64 RefMsgId = 3; // 起始消息remoteId
+    int32 Flag = 6; // 备用
+}

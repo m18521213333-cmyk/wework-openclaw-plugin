@@ -1,0 +1,11 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WTransport.proto";
+
+message UserLabelModifyTaskMessage {
+    int64 WxId = 1; // 商家所属企业Wx号
+    string LabelName = 2; // 标签名 id!=0 会修改标签名
+    int64 LabelId = 3; // 标签id，0则新建标签（如存在同名标签则会失败）
+    int64 TaskId = 4;
+}
+

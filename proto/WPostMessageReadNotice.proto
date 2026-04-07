@@ -1,0 +1,7 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message PostMessageReadNoticeMessage {
+    int64 WxId = 1; // 所属wx号
+    int64 ConvId = 2; // 会话id
+}

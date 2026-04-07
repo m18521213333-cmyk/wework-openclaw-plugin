@@ -1,0 +1,23 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WTransport.proto";
+
+message UserLabelPushNoticeMessage {
+    int64 WxId = 1; // 商家所属企业Wx号
+    repeated UserLabelGroupMessage LabelGroups = 2; // 用户标签组信息
+}
+
+message UserLabelMessage {
+    int64 Id = 1; // 标签id
+    string Name = 2; // 标签名称
+    int32 CreateTime = 3; // 创建时间
+    int64 GroupId = 4; // 标签组id
+}
+
+message UserLabelGroupMessage {
+    int64 Id = 1; // 标签组id
+    int64 Creator = 2; //标签组创建者
+    string Name = 3; // 标签组名称
+    int32 Type = 4; // 类型：1 企业共享标签组，2 个人标签组
+    repeated UserLabelMessage Labels = 5; // 组内用户标签信息
+}

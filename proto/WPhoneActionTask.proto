@@ -1,0 +1,21 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+enum EnumPhoneAction {
+    None = 0; // 空
+    Reboot = 1; // 重启手机
+    UploadLog = 2; // 上传日志
+    UploadFile = 3; // 上传本地文件
+    //CleanAppCache = 4; // 清除客服系统的图片缓存
+    //CleanWxCache = 5; // 清除微信的图片视频缓存
+    CleanFileUrlCache = 6; // 清除手机缓存的文件url（用于防止重复上传）
+    //PhoneCall = 7; //
+}
+message PhoneActionTaskMessage {
+    int64 WxId = 1;
+    string Imei = 2; // 备用，用wxid或imei来定位手机
+    EnumPhoneAction Action = 3; // 指令
+    string StrParam = 4; // 字符串参数，后续扩展用
+    int32 IntParam = 5; // 整型参数，后续扩展用
+    int64 TaskId = 6;
+}

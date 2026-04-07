@@ -1,0 +1,14 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WTransport.proto";
+
+message TalkMessage {
+    EnumContentType ContentType = 1; // 消息类型 Text Picture Voice Video Link File NameCard WeApp Location
+    bytes Content = 2; // 消息内容 文本，url（图片 视频 语音 文件），名片wxid，json(语音 文件 链接 小程序 位置)
+}
+message QunFaTaskMessage {
+    int64 WxId = 1; // 设备企业WX号
+    repeated TalkMessage Msgs = 2;
+    repeated int64 ConvId = 3; //会话 RemoteId
+    int64 TaskId = 4; //
+}

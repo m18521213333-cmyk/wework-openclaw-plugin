@@ -1,0 +1,12 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message SnsCommentTaskMessage {
+    int64 WxId = 1; // 设备企业WX号
+    int64 SnsId = 2; // 朋友圈id
+    string PostId = 3; // 朋友圈postid
+    string Comment = 4; // 评论
+    int64 RefWxId = 5; // 回复的好友id
+    int64 RefCommentId = 6; // 回复的评论id
+    int64 TaskId = 7; //任务id 在TaskResult中回传
+}

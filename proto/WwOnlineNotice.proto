@@ -1,0 +1,25 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WTransport.proto";
+
+message WwOnlineNoticeMessage {
+    int64 WxId = 1; //账号ID
+    string Name = 2; //名称
+    string Alias = 3; //别称
+    string AcctId = 4; //内部账号
+    string Avatar = 5; //微信头像
+    EnumGender Gender = 6; //性别
+    string Job = 7; // 职位
+    string Phone = 8; //
+    int64 CorpId = 9; //公司ID
+    int64 Attr = 10; //属性 备用
+    //SimpleDepartMessage Departs = 11; // 部门信息
+    repeated int64 DepartIds = 11;
+    string IMEI = 12; // imei号
+}
+
+/*
+message SimpleDepartMessage {
+    int64 Id = 1;
+    string Name = 2;
+}*/

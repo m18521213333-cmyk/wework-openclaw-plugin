@@ -1,0 +1,30 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+enum EnumChatRoomAction {
+    RoomName = 0; // 改群名 content=群名称
+    ModifyPublicNoti = 1; // 改公告 content=公告内容
+    AddMember = 2; // 拉人 Members不为空，content=附带消息
+    KickMember = 3; // 踢人
+    RoomShowName = 4; // 修改群内显示名 content=显示名
+    AddToPhonebook = 5; // 加入通讯录 IntValue=0 取消，IntValue=1 加入
+    NewMsgNoti = 6; // 新消息通知 IntValue=0 (消息免打扰 )，IntValue=1 通知
+    ExitRoom = 7; // 退群
+    CreateRoom = 8; // 建群 Members不为空，content=群名称
+    ViewAllMember = 9; // 查看所有群成员
+    TransferOwner = 10; // 群主转让
+    SetVerify = 11; // 设置群聊邀请确认 IntValue=0 关闭，IntValue=1 打开
+    AddManager = 12; // 设置群管理员
+    DelManager = 13; // 删除群管理员
+    SetRemark = 14; // 设置备注 7.0.14版本新功能 content=备注名，最长32
+}
+
+message ChatRoomActionTaskMessage {
+    int64 WxId = 1; // 商家所属微信号
+    int64 ConvId = 2; // 会话id。注意：此处使用id更方便，不是remoteId
+    EnumChatRoomAction Action = 3; // 指令
+    string Content = 4; // 指令内容
+    int32 IntValue = 5; //
+    repeated int64 Members = 6; //操作的联系人（客户）
+    int64 taskId = 7;
+}

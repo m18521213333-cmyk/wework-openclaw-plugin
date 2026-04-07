@@ -1,0 +1,12 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WPullMySnsListTaskResultNotice.proto";
+
+message GetSnsDataTaskResultNoticeMessage {
+    int64 WxId = 1; //
+    bool Success = 2; // 是否成功
+    string ErrMsg = 3; // 错误内容描述 获取 成功时附带的结果内容
+    SnsInfoMessage SnsInfo = 4;
+    int64 TaskId = 5; //任务id 在TaskResult中回传
+}
+

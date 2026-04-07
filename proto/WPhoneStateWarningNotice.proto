@@ -1,0 +1,11 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message PhoneStateWarningNoticeMessage {
+    int64 WxId = 1; //
+    string Imei = 2; //
+    int32 BatteryLevel = 3; // 剩余电量百分比
+    int32 ChargingState = 4; // 0 未知 1 充电 2 满电 3 未充电
+    string NetType = 5; // 联网方式 4G WIFI
+    int64 SdcardFree = 6; // 外部存储（sdcard）剩余空间字节数
+}

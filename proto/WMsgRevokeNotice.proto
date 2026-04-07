@@ -1,0 +1,11 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WTransport.proto";
+
+message MsgRevokeNoticeMessage {
+    int64 WxId = 1; // 设备企业WX号
+    int64 ConvId = 2; // 会话RemoteId
+    int64 MsgId = 3; //服务端的主键id
+    int64 MsgRemoteId = 4; // 消息唯一id
+    int32 Flag = 5;
+}

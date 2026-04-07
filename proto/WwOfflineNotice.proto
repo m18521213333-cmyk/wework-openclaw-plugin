@@ -1,0 +1,8 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message WwOfflineNoticeMessage {
+    int64 WxId = 1; // 微信内部全局唯一识别码
+    string IMEI = 2; // 设备唯一号
+    int32 Type = 3; // 登出原因，备用
+}

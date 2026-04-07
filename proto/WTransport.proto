@@ -1,0 +1,197 @@
+syntax = "proto3";
+import "google/protobuf/any.proto";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+//根传输消息
+message TransportMessage {
+    int64 Id = 1; //消息Id(发送方内保持自增),请求中传入，响应中传回相同值
+    string AccessToken = 2; //设备通信token
+    EnumMsgType MsgType = 3; //承载的具体消息类型
+    google.protobuf.Any Content = 4; //具体的消息数据
+    int64 RefMessageId = 5; //如果是针对某个消息的响应，这里写对应请求的id
+}
+
+//消息类型枚举，一般每一个消息类型都应该对应一个特定的message结构
+//20xx形式的消息类型需要 手机客户端开发者留意
+//30xx形式的消息类型需要 PC客户端开发者留意
+//10xx形式的消息类型需要 手机客户端、PC客户端开发者留意
+enum EnumMsgType {
+
+    UnknownMsg = 0; //未知消息
+
+    HeartBeatReq = 1001; //客户端发送的心跳包
+    MsgReceivedAck = 1002; //消息接收确认回复（接收或拒绝接收）
+    Error = 1003; //将错误单独提升为一种消息类型
+
+    // 设备客户端授权类消息
+    DeviceAuthReq = 1010; //设备(手机客户端、客服客户端)获取通信token请求
+    DeviceAuthRsp = 1011; //设备(手机客户端、客服客户端)获取通信token响应
+    DeviceExitNotice = 1012; //设备授权后退出(仅用于服务端内部)
+    AccountForceOfflineNotice = 1013; //账号强制下线通知
+    RedirectNotice = 1015; // 服务器重定向
+    UpgradeDeviceAppNotice = 1016; // 通知手机客户端软件升级
+
+    PhoneActionTask = 1020; // 通知手机端执行特定任务
+
+    // 手机客户端上传的通知类消息
+    WwOnlineNotice = 1100; //手机客户端微信上线通知
+    WwOfflineNotice = 1101; //手机客户端微信下线通知
+
+    // 手机端信息推送
+    ContactPushNotice = 1105; //手机端推送联系人列表
+    DepartmentPushNotice = 1106; //手机端推送部门信息列表
+    CustomerPushNotice = 1107; //手机端推送客户联系人
+    UserLabelPushNotice = 1108; // 推送客户标签
+    CorporationPushNotice = 1109; // 推送客户公司信息
+    ConversationPushNotice = 1110; // 推送聊天会话（包含群聊信息）
+    NewCustomerPushNotice = 1111; // 手机端推送新客户列表
+    NewCustomerAddedNotice = 1112; // 新客户变更通知
+    CustomerAddNotice = 1113; // 客户新增
+    CustomerDelNotice = 1114; // 客户删除
+    UserLabelChangedNotice = 1115; // 客户标签变化推送，未实现
+    DepartmentChangedNotice = 1116; // 部门信息变化推送，未实现
+    ConversationAddNotice = 1117; // 会话新增通知
+    WxFriendPushNotice = 1118; // 微信好友列表推送，用于从微信好友中添加客户
+    PostMessageReadNotice = 1119; // 手机上消息已读
+    FriendTalkNotice = 1120; //微信好友发来聊天消息
+    TalkToFriendNotice = 1121; // 手机上回复好友的聊天消息
+    TaskResultNotice = 1122; //任务执行结果通知
+    TalkToFriendTaskResultNotice = 1123; // 手机端向服务端通知聊天执行结果
+    DownloadFileResultNotice = 1124; // 文件下载任务或手机端自动下载结果推送
+    PullMyQrCodeTaskResultNotice = 1125; // 获取二维码结果推送
+    ConversationChangedNotice = 1126; // 会话新增通知
+    HistoryMsgPushNotice = 1127; // 消息记录通知
+    PullMySnsListTaskResultNotice = 1128; // 获取我的朋友圈列表结果返回
+    PullSnsTaskListTaskResultNotice = 1129; // 获取企业发布的朋友圈任务结果返回
+    PostSnsTaskResultNotice = 1130; // 发朋友圈结果返回 TODO: 目前snsId未获得，后期优化
+    SnsCommentTaskResultNotice = 1131; // 朋友圈评论结果返回 TODO: 评论id未获得，后期优化
+    GetSnsDataTaskResultNotice = 1132; // 获取单个朋友圈结果返回
+    SnsNotifyNotice = 1133; // 企业朋友圈通知消息 主要为管理员发布朋友圈任务给成员
+    UserLabelModifyTaskResultNotice = 1134; // 新增或修改个人标签结果返回
+    GetContactInfoTaskResultNotice = 1135;
+    PhoneStateTaskResultNotice = 1136; // 手机状态结果返回
+    PhoneStateWarningNotice = 1137; // 手机状态告警提示
+    MsgRevokeNotice = 1138; //消息撤回通知
+    SearchMsgTaskResultNotice = 1139;
+
+    // 推送给手机端的任务
+    TriggerAccountPushTask = 1200; // 触发手机推送微信账号登陆信息
+    TriggerContactPushTask = 1201; // 触发手机推送联系人列表任务
+    TriggerCustomerPushTask = 1202; // 触发手机推送客户列表任务
+    TriggerConversationPushTask = 1203; // 触发手机推送会话列表任务
+    TriggerWechatFriendPushTask = 1204; // 触发手机推送微信好友列表任务
+    TriggerHistoryMsgPushTask = 1205; // 通知手机推送聊天记录
+    TriggerMessageReadTask = 1206; // 通知手机将某个聊天窗口置为已读
+    TriggerUserLabelTask = 1207; // 触发手机推送客户标签
+    TriggerNewCustomerTask = 1208; // 触发手机推送新客户
+
+
+    TalkToFriendTask = 1210; //给好友发消息任务
+    DownloadFileByUrlTask = 1211; // 通过url和authkey下载文件（图片，视频）
+    DownloadFileByMsgIdTask = 1212; // 通过消息Id下载文件（图片，视频）
+    AddCustomerFromWxTask = 1214; // 添加客户-从微信好友中添加
+    AddCustomerFromSearchTask = 1215; // 添加客户-通过手机号搜索添加微信
+    PullMyQrCodeTask = 1216; //服务端主动要求手机上传当前账号的二维码
+    ChatRoomActionTask = 1217; // 群聊管理
+    PullMySnsListTask = 1218; // 获取我的朋友圈列表
+    PullSnsTaskListTask = 1219; // 获取企业管理员发布的朋友圈任务
+    PostSnsTask = 1220; // 发表朋友圈
+    PostSnsTaskTask = 1221; //发表企业群发朋友圈
+    SnsLikeTask = 1222; // 朋友圈点赞
+    SnsCommentTask = 1223; // 朋友圈评论
+    DelSnsTask = 1224; // 删除朋友圈
+    DelSnsCommentTask = 1225; // 删除朋友圈评论
+    GetSnsDataTask = 1226; // 获取一条朋友圈内容
+    UserLabelDelTask = 1227; // 删除个人标签
+    UserLabelModifyTask = 1228; // 新增或修改个人标签
+    UserLabelSetTask = 1229; // 设置标签任务（基于标签）
+    AddCustomerByIdTask = 1230; // 通过微信好友的openid添加客户
+    GetContactInfoTask = 1231; // 获取联系人信息
+    AcceptCustomerTask = 1232; // 通过新客户验证
+    UserSetLabelTask = 1233; // 联系人(客户）设置标签（基于客户）开发中
+    SetUserMemoTask = 1234; // 修改备注 开发中
+    PhoneStateTask = 1235; // 获取手机状态
+    MsgRevokeTask = 1236; // 消息撤回
+    SearchMsgTask = 1237; // 消息搜索
+    AddCustomerByGroupTask = 1238; //外部群加客户
+    ForwardMsgTask = 1239; // 转发消息
+    ForwardMultiTask = 1240; // 多条转发
+
+}
+
+// 全局错误码表
+enum EnumErrorCode {
+    Success = 0; //无错误
+    NoRight = 1001; //无权限
+    InvalidParam = 1002; //数据信息不合法
+    InternalError = 1003; //内部处理错误
+    TargetNotOnline = 1004; //发送消息或指令时对方不在线
+    InfoNotExists = 1005;
+}
+
+// 性别枚举
+enum EnumGender {
+    UnknownGender = 0; //未知
+    Male = 1; //男
+    Female = 2; //女
+}
+
+// 聊天内容类型
+enum EnumContentType {
+    UnknownContent = 0; // 未知内容
+    Text = 1; // 文本内容
+    Picture = 2; // 图片消息
+    Voice = 3; // 语音消息
+    Video = 4; // 视频消息
+    System = 5; //系统消息
+    Link = 6; // 链接消息
+    LinkExt = 7; // 扩展的链接消息（小程序分享等），内容为xml格式，暂未使用
+    File = 8; // 文件发送
+    NameCard = 9; // 名片
+    Location = 10; // 位置信息
+    LuckyMoney = 11; // 红包
+    MoneyTrans = 12; // 转账
+    WeApp = 13; // 小程序
+    Emoji = 14; //
+    RoomManage = 15; // 群管理消息
+    Sys_LuckyMoney = 16; // 领取红包消息
+    RoomSystem = 17; // 群聊系统消息
+    BizLink = 18; // 公众号文章
+    AudioCall = 19; // 语音通话
+    VideoCall = 20; // 视频通话
+    NotifyMsg = 21; // 服务通知
+    QuoteMsg = 22; // 引用通知
+    ForwardMsg = 23; // 转发的消息记录
+    SnsNotify = 24; // 朋友圈通知
+    UnSupport = 99; // 不支持的消息
+}
+
+// 设备 ~ 微信号 在线状态枚举
+enum EnumOnlineState {
+    UnknownState = 0; // 未知，在条件中可认为是全部
+    Online = 1; // 在线
+    Offline = 2; // 离线
+}
+
+// 账号类型
+enum EnumAccountType {
+    UnknownAccountType = 0; // 未知
+    Main = 1; // 主账号
+    SubUser = 2; // 子账号
+}
+
+// 消息发送状态
+enum EnumSendStatus {
+    NoAction = 0x00; // 无状态
+    Sending = 0x01; // 发送中
+    SendSuccess = 0x11; // 发送成功
+    SendError = 0x10; // 发送失败
+}
+
+//被强制下线的原因
+enum EnumForceOfflineReason {
+    NoReason = 0; //就是要下线你 
+    TickedByOther = 1; //别处登录挤下线了 
+    ByReAlloc = 2; // 被重新分配
+    ServiceExpired = 3; // 服务到期
+}

@@ -1,0 +1,9 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WConversationPushNotice.proto";
+
+message ConversationChangedNoticeMessage {
+    int64 WxId = 1; // 设备企业WX号
+    ConversationMessage Convers = 2; // 会话
+}
+

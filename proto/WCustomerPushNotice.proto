@@ -1,0 +1,26 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WTransport.proto";
+
+message CustomerPushNoticeMessage {
+    int64 WxId = 1; // 设备企业WX号
+    repeated CustomerMessage Contacts = 2; // 好友信息模型 多个
+    int32 Size = 3;
+    int32 Count = 4;
+    int32 Page = 5;
+}
+
+message CustomerMessage {
+    int64 RemoteId = 1; //唯一id （RemoteId>>48==20 App; RemoteId>>48==28 微信用户; RemoteId>>48==33,34 外部客户； RemoteId>>48==39 群机器人； RemoteId>>48==30 内部客服； RemoteId>>48==32 VIP客户；）
+    string Name = 2;
+    string Alias = 3;
+    string Avatar = 4;
+    string Mobile = 5;
+    string UnionId = 6; // 微信UnionId，可能为空
+    EnumGender Gender = 7;
+    int64 CorpId = 8;
+    int32 AddTime = 9;
+    int32 Source = 10; // 添加来源
+    repeated int64 LabelIds = 11; //设置的用户标签
+    string Suffix = 12; // 后缀
+}

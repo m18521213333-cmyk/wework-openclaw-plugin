@@ -1,0 +1,14 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WTransport.proto";
+
+message CorporationPushNoticeMessage {
+    int64 WxId = 1; // 设备企业WX号
+    repeated CorporationMessage Corps = 2; // 企业信息
+}
+
+message CorporationMessage {
+    int64 Id = 1;
+    string Name = 2;
+}
+

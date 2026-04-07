@@ -1,0 +1,10 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WCustomerPushNotice.proto";
+
+message CustomerAddNoticeMessage {
+    int64 WxId = 1; // 设备企业WX号
+    CustomerMessage Contact = 2; // 好友信息模型
+}
+
+

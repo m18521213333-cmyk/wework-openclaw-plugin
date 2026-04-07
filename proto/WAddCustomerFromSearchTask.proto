@@ -1,0 +1,12 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message AddCustomerFromSearchTaskMessage {
+    int64 WxId = 1; //
+    string Key = 2; // 搜索关键字
+    string Msg = 3; // 招呼语, 缺省：我是xxx公司的xxx，添加我的企业微信与我联系吧。
+    string Memo = 4;
+    repeated string Labels = 5;
+    int64 TaskId = 6;
+    bool AddByGroup = 7;
+}

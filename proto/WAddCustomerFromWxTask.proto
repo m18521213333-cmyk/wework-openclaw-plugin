@@ -1,0 +1,10 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message AddCustomerFromWxTaskMessage {
+    int64 WxId = 1; //
+    int32 Count = 2; // 添加的个数
+    int32 Index = 3; // 添加的起始位置
+    string Msg = 4; // 招呼语，缺省：你好这是我的企业微信，以后也可以在这里与我联系。
+    int64 TaskId = 5;
+}

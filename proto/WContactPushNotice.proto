@@ -1,0 +1,32 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WTransport.proto";
+
+message ContactPushNoticeMessage {
+    int64 WxId = 1; // 设备企业WX号
+    repeated ContactMessage Contacts = 2; // 好友信息模型 多个
+    int32 Size = 3;
+    int32 Count = 4;
+    int32 Page = 5;
+}
+
+message ContactMessage {
+    int64 RemoteId = 1; //唯一id
+    // RemoteId>>48==20 App;
+    // RemoteId>>48==28 微信用户;
+    // RemoteId>>48==33,34 外部客户；
+    // RemoteId>>48==39 群机器人；
+    // RemoteId>>48==30 内部客服；
+    // RemoteId>>48==32 VIP客户；
+    string AcctId = 2; // 企业内部id
+    string Name = 3; //
+    string Alias = 4;
+    string Avatar = 5;
+    string Job = 6; // 职位
+    string Mobile = 7;
+    string UnionId = 8;
+    EnumGender Gender = 9;
+    repeated int64 DepartIds = 10; // 所属部门id
+    int64 Attr = 11; // 属性 (attr & 64) == 64 || (attr & 33554432) == 33554432 已激活企业微信
+    //int64 CorpId = 12;
+}

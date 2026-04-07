@@ -1,0 +1,10 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+// 通用Trigger任务消息
+message PullMyQrCodeTaskResultNoticeMessage {
+    int64 WxId = 1; //
+    bool Success = 2; // 是否成功
+    string ErrMsg = 4; // 错误内容描述 获取 成功时附带的结果内容
+    string Url = 5; //
+}

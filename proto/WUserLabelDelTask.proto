@@ -1,0 +1,10 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WTransport.proto";
+
+message UserLabelDelTaskMessage {
+    int64 WxId = 1; // 商家所属企业Wx号
+    int64 LabelId = 2;
+    int64 TaskId = 3;
+}
+

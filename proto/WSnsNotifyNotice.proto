@@ -1,0 +1,11 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WPullMySnsListTaskResultNotice.proto";
+
+message SnsNotifyNoticeMessage {
+    int64 WxId = 1; //
+    string Content = 2; // 错误内容描述 获取 成功时附带的结果内容
+    SnsInfoMessage SnsInfo = 3;
+    int32 Type = 4;
+}
+

@@ -1,0 +1,17 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WPullMySnsListTaskResultNotice.proto";
+
+message PullSnsTaskListTaskResultNoticeMessage {
+    int64 WxId = 1; //
+    bool Success = 2; // 是否成功
+    string ErrMsg = 3; // 错误内容描述 获取 成功时附带的结果内容
+    repeated SnsTaskMessage TaskList = 4;
+}
+
+message SnsTaskMessage {
+    int64 Author = 1;
+    SnsInfoMessage SnsInfo = 2;
+    bool Posted = 3; // 是否已发表
+    //int32 PostCnt = 4; // 成员发表统计
+}

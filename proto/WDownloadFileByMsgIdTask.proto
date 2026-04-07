@@ -1,0 +1,10 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message DownloadFileByMsgIdTaskMessage {
+    int64 WxId = 1; //
+    int64 MsgId = 2;
+    int64 MsgRemoteId = 3; //
+    int32 FileType = 4; // 下载文件的类型 0 原始文件（原图，视频，音频，文件）
+    int64 TaskId = 5;
+}

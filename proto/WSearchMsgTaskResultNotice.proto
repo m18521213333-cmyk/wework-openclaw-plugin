@@ -1,0 +1,26 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WHistoryMsgPushNotice.proto";
+
+message ConvMessage {
+    int64 Id = 1; //
+    int64 RemoteId = 2; // 单聊=联系人RemoteId, 群聊=公司id，部门id或其他
+    string Name = 3;
+    string Avatar = 4;
+    int32 Type = 5; // 0 单聊 1 群聊
+}
+
+message SearchResult{
+    ConvMessage conv = 1;
+    repeated ChatMessage Msgs = 2;
+}
+
+message SearchMsgTaskResultNoticeMessage {
+    int64 WxId = 1; // 设备企业WX号
+    string Keyword = 2; //
+    bool Success = 3; //
+    string ErrMsg = 4;
+    repeated SearchResult Results = 5;
+
+}
+

@@ -1,0 +1,36 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message PostSnsTaskMessage {
+    int64 WxId = 1; // 设备企业WX号
+    string Content = 2; //发布的文案
+    MediaMessage Media = 3; //携带的图片、视频、链接等资源
+    string Comment = 4; // 评论 TODO: 暂未实现
+    VisibleMessage Visible = 5; // 可见范围
+    int64 TaskId = 6; //任务id 在TaskResult中回传
+    PoiMessage Poi = 7; // 地理信息 TODO: 暂未实现
+}
+
+message MediaMessage {
+    EnumAttachType Type = 1; //附件类型
+    repeated string Content = 2; //资源url，注意次序！[视频url,缩略图url]；[图片url,图片url,..]；[链接url;标题;图片url]
+    //附件类型
+    enum EnumAttachType {
+        Picture = 0; //图片
+        Video = 1; //短视频
+        Link = 2; //链接
+    }
+}
+
+message VisibleMessage {
+    repeated int64 userIds = 1;
+    repeated int64 labelIds = 2;
+}
+
+message PoiMessage {
+    string City = 1; // 城市
+    string Address = 2; // 地址
+    string PoiName = 3; // 显示的名称
+    double Lon = 4; // 经度
+    double Lat = 5; // 纬度
+}

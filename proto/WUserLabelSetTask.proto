@@ -1,0 +1,13 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WTransport.proto";
+
+message UserLabelSetTaskMessage {
+    int64 WxId = 1; // 商家所属企业Wx号
+    int64 LabelId = 3; // 标签id
+    bool IsCorp = 4; // 是否为公司标签
+    repeated int64 AddUsers = 5; // 新增的客户id
+    repeated int64 DelUsers = 6; // 删除的客户id
+    int64 TaskId = 7;
+}
+

@@ -1,0 +1,15 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message DepartmentPushNoticeMessage {
+    int64 WxId = 1; // 设备企业WX号
+    repeated DepartmentMessage Departs = 2; // 部门信息
+}
+
+message DepartmentMessage {
+    int64 RemoteId = 1;
+    int64 ParentId = 2; // 上级部门id
+    string Name = 3;
+    int64 GroupId = 4; // 群聊id
+    int32 UserCnt = 5;
+}

@@ -1,0 +1,14 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+import "WTransport.proto";
+message TaskResultNoticeMessage {
+    int64 WxId = 1; // 设备企业WX号
+    EnumMsgType TaskType = 2; //原来执行的任务的类型
+    int64 TaskId = 3; // 业务的id,通用的。
+    bool Success = 4; // 是否成功
+    EnumErrorCode Code = 5; // 错误码 Success = true 忽略
+    string ErrMsg = 6; // 错误内容描述
+    string Ext = 7; // 自定义返回数据 string
+    int64 ExtId = 8; // 自定义返回数据 long
+}

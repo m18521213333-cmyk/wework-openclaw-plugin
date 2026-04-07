@@ -1,0 +1,97 @@
+{
+  "id": "wework-scrm",
+  "name": "WeWork SCRM",
+  "description": "企业微信 SCRM 插件 - 通过 OpenClaw Agent 管理企业微信的消息、联系人、群聊、朋友圈等功能",
+  "version": "0.1.0",
+  "author": "wework-scrm",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "websocket": {
+        "type": "object",
+        "description": "WebSocket 服务配置（与手机端SDK通信）",
+        "properties": {
+          "port": {
+            "type": "number",
+            "default": 15087,
+            "description": "WebSocket 监听端口"
+          },
+          "host": {
+            "type": "string",
+            "default": "0.0.0.0",
+            "description": "监听地址"
+          }
+        }
+      },
+      "storage": {
+        "type": "object",
+        "description": "数据存储配置",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["sqlite", "mysql"],
+            "default": "sqlite",
+            "description": "存储类型"
+          },
+          "sqlitePath": {
+            "type": "string",
+            "default": "./wework-scrm.db",
+            "description": "SQLite 数据库路径"
+          },
+          "mysqlUrl": {
+            "type": "string",
+            "description": "MySQL 连接地址（可选）"
+          }
+        }
+      },
+      "redis": {
+        "type": "object",
+        "description": "Redis 缓存配置（可选）",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "url": {
+            "type": "string",
+            "default": "redis://127.0.0.1:6379"
+          }
+        }
+      },
+      "dify": {
+        "type": "object",
+        "description": "Dify AI 集成配置（可选）",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "apiUrl": {
+            "type": "string",
+            "description": "Dify API 地址"
+          },
+          "apiKey": {
+            "type": "string",
+            "description": "Dify API Key"
+          }
+        }
+      },
+      "autoReply": {
+        "type": "object",
+        "description": "自动回复设置",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "timeRange": {
+            "type": "string",
+            "default": "0:24",
+            "description": "自动回复时间段 (格式: 起始小时:结束小时)"
+          }
+        }
+      }
+    },
+    "required": []
+  }
+}

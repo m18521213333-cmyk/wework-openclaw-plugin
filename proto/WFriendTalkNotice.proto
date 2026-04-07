@@ -1,0 +1,18 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WTransport.proto";
+
+message FriendTalkNoticeMessage {
+    int64 WxId = 1; // 设备企业WX号
+    int64 ConvId = 2; // 会话RemoteId
+    int64 SenderId = 3; // 消息发送者Id
+    EnumContentType ContentType = 4; // 发送的消息内容类型
+    bytes Content = 5; // 内容 二进制流
+    int64 MsgId = 6; //服务端的主键id
+    int64 MsgRemoteId = 7; // 消息唯一id
+    int64 CreateTime = 8; // 消息时间
+    string SenderName = 9; // 消息发送者名称
+    int64 RefId = 10; // 引用消息的id
+    int32 Flag = 11;
+    bool IsRevoke = 12;
+}

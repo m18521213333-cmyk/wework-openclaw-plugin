@@ -1,0 +1,19 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+import "WTransport.proto";
+
+message WxFriendPushNoticeMessage {
+    int64 WxId = 1; // 设备企业WX号
+    repeated WxFriendMessage Friends = 2; // 好友信息模型 多个
+    int32 Size = 3;
+    int32 Count = 4;
+    int32 Page = 5;
+}
+
+message WxFriendMessage {
+    string Name = 1; // 昵称
+    string Avatar = 2; // 头像
+    string OpenId = 3; // openId
+    string UnionId = 4; // unionId contactKey
+    bool HasSent = 5; // 是否已发送过邀请
+}

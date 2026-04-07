@@ -1,0 +1,48 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message PullMySnsListTaskResultNoticeMessage {
+    int64 WxId = 1; //
+    bool Success = 2; // 是否成功
+    string ErrMsg = 3; // 错误内容描述 获取 成功时附带的结果内容
+    repeated SnsInfoMessage SnsList = 4;
+    int64 NextSeq = 5; // 下一页起始Seq
+}
+
+message SnsInfoMessage {
+    int64 Author = 1;
+    string Content = 2;
+    repeated SnsMediaInfoMessage Images = 3;
+    SnsMediaInfoMessage Link = 4;
+    SnsMediaInfoMessage Video = 5;
+    repeated SnsCommentMessage Comments = 6;
+    repeated SnsLikeMessage Likes = 7;
+    int64 SnsId = 8;
+    int32 Time = 9;
+    string PostId = 10;
+    int32 Type = 11; // 0 员工发表，2 企业发表
+    // SnsPoiInfo poi 位置信息
+    // repeated int64 visibleIds 可见范围
+}
+
+message SnsMediaInfoMessage {
+    string ThumbImg = 1; // 缩略图地址
+    string Url = 2; // 大图地址，链接地址 视频地址等
+    string Desc = 3; // 描述，标题等
+    //string mediaId = 4; // 媒体id
+}
+
+message SnsCommentMessage {
+    int64 FriendId = 1; // 评论人的微信号
+    string Content = 2; // 评论内容
+    int64 CommentId = 3; // 微信本地数据库的id
+    int64 ReplyCommentId = 4; // 回复的微信本地数据库的id
+    int64 ReplyWxId = 5; // 评论对象的微信号
+    int32 Time = 6; // 评论时间
+    string PostId = 7;
+}
+
+message SnsLikeMessage {
+    int64 FriendId = 1;
+    int32 Time = 2;
+}

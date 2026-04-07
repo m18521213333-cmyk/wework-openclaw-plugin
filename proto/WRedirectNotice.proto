@@ -1,0 +1,9 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+message RedirectNoticeMessage {
+    int32 Type = 1; // 类型，0：临时变更，1：永久变更
+    string ServerUrl = 2; // 业务服务器地址
+    int32 ServerPort = 3; // 业务服务器端口
+    //string UploadUrl = 4;
+}

@@ -1,0 +1,9 @@
+syntax = "proto3";
+package Im.Scrm.Ww.Proto; //命名空间约定
+
+// 通用Trigger任务消息
+message CommonTriggerTaskMessage {
+    int64 WxId = 1; //
+    int32 Flag = 2; // 备用
+    int64 Time = 3; // 备用
+}
