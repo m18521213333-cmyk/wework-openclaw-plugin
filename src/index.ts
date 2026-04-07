@@ -149,12 +149,52 @@ export default definePluginEntry({
     api.registerCli(({ program }: { program: any }) => {
       const ww = program.command("wework").description("WeWork SCRM 管理");
 
+      let cliInitiatedConnection = false;
+
+      /** CLI 模式下确保 WS 客户端已初始化并连接 */
+      async function ensureConnected(): Promise<boolean> {
+        let client = getWeWorkClient();
+        if (!client) {
+          // CLI 模式下 service.start() 不会被调用，需要手动初始化
+          client = getWeWorkClient({ serverUrl: cfg.javaWsUrl });
+          cliInitiatedConnection = true;
+          try {
+            await new Promise<void>((resolve, reject) => {
+              const timeout = setTimeout(() => reject(new Error("连接超时")), 5000);
+              client!.once("connected", () => { clearTimeout(timeout); resolve(); });
+              client!.once("error", (e: Error) => { clearTimeout(timeout); reject(e); });
+              client!.start();
+            });
+          } catch (e: any) {
+            console.log(`❌ 无法连接 Java 后端 (${cfg.javaWsUrl}): ${e.message}`);
+            return false;
+          }
+        }
+        return true;
+      }
+
+      /** CLI 命令执行完后断开连接，让进程正常退出 */
+      async function cleanupConnection(): Promise<void> {
+        if (cliInitiatedConnection) {
+          const client = getWeWorkClient();
+          if (client) await client.stop();
+        }
+      }
+
+      /** 包装 action：自动连接 + 执行 + 断开 */
+      function withConnection<T extends (...args: any[]) => void>(fn: T) {
+        return async (...args: Parameters<T>) => {
+          if (!await ensureConnected()) return;
+          try { await fn(...args); } finally { await cleanupConnection(); }
+        };
+      }
+
       // --- 状态 ---
-      ww.command("status").description("查看连接状态").action(() => {
+      ww.command("status").description("查看连接状态").action(withConnection(async () => {
         const c = getWeWorkClient();
-        if (!c) { console.log("插件未启动"); return; }
+        if (!c) { console.log("❌ 插件未启动"); return; }
         console.log(`Java 后端: ${c.connected ? "✅ 已连接" : "❌ 未连接"} (${cfg.javaWsUrl})`);
-      });
+      }));
 
       // --- 发消息 ---
       ww.command("send")
@@ -163,10 +203,10 @@ export default definePluginEntry({
         .argument("<convId>", "目标会话ID")
         .argument("<message>", "消息内容")
         .option("-t, --type <type>", "消息类型: text/image/file/link", "text")
-        .action((wxId: string, convId: string, message: string, opts: { type: string }) => {
+        .action(withConnection(async (wxId: string, convId: string, message: string, opts: { type: string }) => {
           const r = sendMessage(wxId, convId, message, opts.type);
           console.log(r.success ? `✅ 消息已发送 → ${convId}` : `❌ ${r.error}`);
-        });
+        }));
 
       // --- 搜索消息 ---
       ww.command("search")
@@ -174,10 +214,10 @@ export default definePluginEntry({
         .argument("<wxId>", "企业微信ID")
         .argument("<keyword>", "搜索关键词")
         .option("-c, --conv <convId>", "限定会话")
-        .action((wxId: string, keyword: string, opts: { conv?: string }) => {
+        .action(withConnection(async (wxId: string, keyword: string, opts: { conv?: string }) => {
           const r = searchMessages(wxId, keyword, opts.conv);
           console.log(r.success ? `✅ 搜索指令已发送: "${keyword}"` : `❌ ${r.error}`);
-        });
+        }));
 
       // --- 历史消息 ---
       ww.command("history")
@@ -185,20 +225,20 @@ export default definePluginEntry({
         .argument("<wxId>", "企业微信ID")
         .argument("<convId>", "会话ID")
         .option("-n, --count <n>", "条数", "50")
-        .action((wxId: string, convId: string, opts: { count: string }) => {
+        .action(withConnection(async (wxId: string, convId: string, opts: { count: string }) => {
           const r = triggerHistoryMessages(wxId, convId, parseInt(opts.count));
           console.log(r.success ? `✅ 拉取 ${opts.count} 条历史消息` : `❌ ${r.error}`);
-        });
+        }));
 
       // --- 联系人信息 ---
       ww.command("contact")
         .description("查询联系人")
         .argument("<wxId>", "企业微信ID")
         .argument("<remoteId>", "联系人ID")
-        .action((wxId: string, remoteId: string) => {
+        .action(withConnection(async (wxId: string, remoteId: string) => {
           const r = getContactInfo(wxId, remoteId);
           console.log(r.success ? `✅ 查询已发送: ${remoteId}` : `❌ ${r.error}`);
-        });
+        }));
 
       // --- 群发 ---
       ww.command("mass-send")
@@ -207,11 +247,11 @@ export default definePluginEntry({
         .argument("<message>", "消息内容")
         .option("-t, --type <type>", "消息类型", "text")
         .option("--to <ids...>", "目标会话ID列表")
-        .action((wxId: string, message: string, opts: { type: string; to: string[] }) => {
+        .action(withConnection(async (wxId: string, message: string, opts: { type: string; to: string[] }) => {
           if (!opts.to?.length) { console.log("❌ 请指定 --to <会话ID列表>"); return; }
           const r = massSend(wxId, opts.to, message, opts.type);
           console.log(r.success ? `✅ 群发 → ${opts.to.length} 个会话` : `❌ ${r.error}`);
-        });
+        }));
 
       // --- 群聊操作 ---
       ww.command("group")
@@ -221,10 +261,10 @@ export default definePluginEntry({
         .option("-g, --group <convId>", "群会话ID")
         .option("-m, --members <ids...>", "成员ID列表")
         .option("-c, --content <text>", "群名/公告内容")
-        .action((wxId: string, action: string, opts: { group?: string; members?: string[]; content?: string }) => {
+        .action(withConnection(async (wxId: string, action: string, opts: { group?: string; members?: string[]; content?: string }) => {
           const r = chatRoomAction(wxId, action, opts.group, opts.members, opts.content);
           console.log(r.success ? `✅ 群操作 ${action} 已发送` : `❌ ${r.error}`);
-        });
+        }));
 
       // --- 发朋友圈 ---
       ww.command("moments")
@@ -233,38 +273,38 @@ export default definePluginEntry({
         .argument("<content>", "文字内容")
         .option("-t, --type <type>", "类型: text/image/video/link", "text")
         .option("--media <urls...>", "图片/视频URL")
-        .action((wxId: string, content: string, opts: { type: string; media?: string[] }) => {
+        .action(withConnection(async (wxId: string, content: string, opts: { type: string; media?: string[] }) => {
           const r = postMoments(wxId, content, opts.type, opts.media);
           console.log(r.success ? "✅ 朋友圈发布指令已发送" : `❌ ${r.error}`);
-        });
+        }));
 
       // --- 查看朋友圈 ---
       ww.command("my-moments")
         .description("拉取我的朋友圈")
         .argument("<wxId>", "企业微信ID")
-        .action((wxId: string) => {
+        .action(withConnection(async (wxId: string) => {
           const r = pullMySns(wxId);
           console.log(r.success ? "✅ 朋友圈列表拉取已发送" : `❌ ${r.error}`);
-        });
+        }));
 
       // --- 同步数据 ---
       ww.command("sync")
         .description("触发数据同步")
         .argument("<wxId>", "企业微信ID")
         .argument("<type>", "类型: contacts/customers/conversations/labels/all")
-        .action((wxId: string, type: string) => {
+        .action(withConnection(async (wxId: string, type: string) => {
           const r = triggerSync(wxId, type);
           console.log(r.success ? `✅ ${type} 同步已发送` : `❌ ${r.error}`);
-        });
+        }));
 
       // --- 手机状态 ---
       ww.command("phone")
         .description("查询手机状态")
         .argument("<wxId>", "企业微信ID")
-        .action((wxId: string) => {
+        .action(withConnection(async (wxId: string) => {
           const r = phoneState(wxId);
           console.log(r.success ? "✅ 手机状态查询已发送" : `❌ ${r.error}`);
-        });
+        }));
 
     }, { commands: ["wework"] });
 
