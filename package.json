@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "WeWork SCRM plugin for OpenClaw - 企业微信SCRM管理插件",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
@@ -34,5 +34,10 @@
     "企业微信"
   ],
   "author": "",
-  "license": "ISC"
+  "license": "ISC",
+  "openclaw": {
+    "extensions": [
+      "./dist/index.js"
+    ]
+  }
 }
