@@ -1,16 +1,18 @@
 /**
- * 消息发送辅助层 (生产级)
+ * 消息发送辅助层 (方案B: 通过 Java 后端 WS JSON 协议)
  *
- * 所有 Tool → 本模块 → WeWorkServer.sendToDevice() → Protobuf 编码 → 手机端 SDK
+ * 调用链:
+ *   OpenClaw Agent/CLI → 本模块 → WeWorkClient.sendCommand() → Java WS :15088 → 手机端
+ *
+ * JSON 协议格式 (与 PC 前端完全一致):
+ *   { "MsgType": "TalkToFriendTask", "Content": { "WxId": 12345, ... } }
  *
  * 对应原 Java:
- *   AsyncTaskService.msgSend2Phone()  → sendToPhone()
- *   MessageUtil.sendMsgByType()       → sendMessage()
- *   MsgIdBuilder.getId()              → 在 codec.ts 内部自增
+ *   WebSocketMessageProcessor.handler() → 根据 MsgType 分发
+ *   XxxWebsocketHandler.handleMsg()     → asyncTaskService.msgSend2Phone()
  */
 
-import { getWeWorkServer } from "./websocket-service.js";
-import { EnumMsgType, contentTypeValue } from "../proto/codec.js";
+import { getWeWorkClient } from "./websocket-service.js";
 
 // ============================================
 // 发送结果
@@ -26,24 +28,39 @@ export interface SendResult {
 // ============================================
 
 /**
- * 向手机端发送指令 (Protobuf 二进制)
- * 对应原 asyncTaskService.msgSend2Phone()
+ * 通过 Java 后端 WS 发送指令
+ * 对应原 PC 前端 WebSocket 发 JSON → WebSocketMessageProcessor 分发
  */
-export function sendToPhone(
-  wxId: string,
-  msgType: number,
-  payload: Record<string, unknown>,
+export function sendToJava(
+  msgType: string,
+  content: Record<string, unknown>,
 ): SendResult {
-  const server = getWeWorkServer();
-  if (!server) {
-    return { success: false, error: "通信服务未启动" };
+  const client = getWeWorkClient();
+  if (!client) {
+    return { success: false, error: "WS 客户端未初始化" };
+  }
+  if (!client.connected) {
+    return { success: false, error: "未连接 Java 后端" };
   }
 
-  const ok = server.sendToDevice(wxId, msgType, payload);
+  const ok = client.sendCommand(msgType, content);
   if (!ok) {
-    return { success: false, error: `企业微信 ${wxId} 不在线` };
+    return { success: false, error: "发送失败" };
   }
   return { success: true };
+}
+
+// ============================================
+// 内容类型映射
+// ============================================
+
+function contentTypeValue(name: string): number {
+  const map: Record<string, number> = {
+    text: 0, image: 1, voice: 2, video: 3,
+    link: 4, file: 5, namecard: 6, location: 7,
+    weapp: 8, emoji: 9,
+  };
+  return map[name.toLowerCase()] ?? 0;
 }
 
 // ============================================
@@ -58,27 +75,27 @@ export function sendMessage(
     WxId: Number(wxId),
     ConvId: Number(convId),
     ContentType: contentTypeValue(contentType),
-    Content: Buffer.from(content, "utf-8"),
+    Content: content,
     TaskId: Date.now(),
   };
   if (atList?.length) payload.AtSomeOne = atList.map(Number);
-  return sendToPhone(wxId, EnumMsgType.TalkToFriendTask, payload);
+  return sendToJava("TalkToFriendTask", payload);
 }
 
 export function revokeMessage(wxId: string, msgId: string, convId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.MsgRevokeTask, {
+  return sendToJava("MsgRevokeTask", {
     WxId: Number(wxId), MsgId: Number(msgId), ConvId: Number(convId),
   });
 }
 
 export function forwardMessage(wxId: string, msgId: string, fromConvId: string, toConvId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.ForwardMsgTask, {
+  return sendToJava("ForwardMsgTask", {
     WxId: Number(wxId), MsgId: Number(msgId), ConvId: Number(fromConvId), ToConvId: Number(toConvId),
   });
 }
 
 export function forwardMultiMessages(wxId: string, msgIds: string[], fromConvId: string, toConvId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.ForwardMultiTask, {
+  return sendToJava("ForwardMultiTask", {
     WxId: Number(wxId), MsgIds: msgIds.map(Number), ConvId: Number(fromConvId), ToConvId: Number(toConvId),
   });
 }
@@ -86,11 +103,11 @@ export function forwardMultiMessages(wxId: string, msgIds: string[], fromConvId:
 export function searchMessages(wxId: string, keyword: string, convId?: string): SendResult {
   const p: Record<string, unknown> = { WxId: Number(wxId), Keyword: keyword };
   if (convId) p.ConvId = Number(convId);
-  return sendToPhone(wxId, EnumMsgType.SearchMsgTask, p);
+  return sendToJava("SearchMsgTask", p);
 }
 
 export function triggerHistoryMessages(wxId: string, convId: string, count: number = 50): SendResult {
-  return sendToPhone(wxId, EnumMsgType.TriggerHistoryMsgPushTask, {
+  return sendToJava("TriggerHistoryMsgPushTask", {
     WxId: Number(wxId), ConvId: Number(convId), Count: count,
   });
 }
@@ -100,48 +117,47 @@ export function triggerHistoryMessages(wxId: string, convId: string, count: numb
 // ============================================
 
 export function getContactInfo(wxId: string, remoteId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.GetContactInfoTask, { WxId: Number(wxId), RemoteId: Number(remoteId) });
+  return sendToJava("GetContactInfoTask", { WxId: Number(wxId), RemoteId: Number(remoteId) });
 }
 
 export function addCustomerById(wxId: string, remoteId: string, verifyContent?: string): SendResult {
   const p: Record<string, unknown> = { WxId: Number(wxId), RemoteId: Number(remoteId) };
   if (verifyContent) p.VerifyContent = verifyContent;
-  return sendToPhone(wxId, EnumMsgType.AddCustomerByIdTask, p);
+  return sendToJava("AddCustomerByIdTask", p);
 }
 
 export function addCustomerFromSearch(wxId: string, searchText: string, verifyContent?: string): SendResult {
   const p: Record<string, unknown> = { WxId: Number(wxId), SearchText: searchText };
   if (verifyContent) p.VerifyContent = verifyContent;
-  return sendToPhone(wxId, EnumMsgType.AddCustomerFromSearchTask, p);
+  return sendToJava("AddCustomerFromSearchTask", p);
 }
 
 export function addCustomerFromWx(wxId: string, wxFriendId: string, verifyContent?: string): SendResult {
   const p: Record<string, unknown> = { WxId: Number(wxId), WxFriendId: Number(wxFriendId) };
   if (verifyContent) p.VerifyContent = verifyContent;
-  return sendToPhone(wxId, EnumMsgType.AddCustomerFromWxTask, p);
+  return sendToJava("AddCustomerFromWxTask", p);
 }
 
 export function deleteCustomer(wxId: string, remoteId: string): SendResult {
-  // 原系统没有独立的 DelCustomerTask proto, 用通用方式
-  return sendToPhone(wxId, EnumMsgType.TriggerCustomerPushTask, { WxId: Number(wxId), RemoteId: Number(remoteId) });
+  return sendToJava("TriggerCustomerPushTask", { WxId: Number(wxId), RemoteId: Number(remoteId) });
 }
 
 export function acceptCustomer(wxId: string, remoteId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.AcceptCustomerTask, { WxId: Number(wxId), RemoteId: Number(remoteId) });
+  return sendToJava("AcceptCustomerTask", { WxId: Number(wxId), RemoteId: Number(remoteId) });
 }
 
 export function setUserMemo(wxId: string, remoteId: string, memo: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.SetUserMemoTask, { WxId: Number(wxId), RemoteId: Number(remoteId), Memo: memo });
+  return sendToJava("SetUserMemoTask", { WxId: Number(wxId), RemoteId: Number(remoteId), Memo: memo });
 }
 
 export function getExtUserId(wxId: string, remoteId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.GetExtUserIdTask, { WxId: Number(wxId), RemoteId: Number(remoteId) });
+  return sendToJava("GetExtUserIdTask", { WxId: Number(wxId), RemoteId: Number(remoteId) });
 }
 
 export function sendFriendVerify(wxId: string, remoteId: string, verifyContent?: string): SendResult {
   const p: Record<string, unknown> = { WxId: Number(wxId), RemoteId: Number(remoteId) };
   if (verifyContent) p.VerifyContent = verifyContent;
-  return sendToPhone(wxId, EnumMsgType.AddCustomerByIdTask, p); // 同用 AddCustomerById
+  return sendToJava("AddCustomerByIdTask", p);
 }
 
 // ============================================
@@ -154,36 +170,36 @@ export function chatRoomAction(wxId: string, action: string, convId?: string, me
   if (convId) p.ConvId = Number(convId);
   if (members) p.Members = members.map(Number);
   if (content) p.Content = content;
-  return sendToPhone(wxId, EnumMsgType.ChatRoomActionTask, p);
+  return sendToJava("ChatRoomActionTask", p);
 }
 
 export function getGroupMembers(wxId: string, convId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.ChatRoomActionTask, { WxId: Number(wxId), ConvId: Number(convId), Action: -1 });
+  return sendToJava("ChatRoomActionTask", { WxId: Number(wxId), ConvId: Number(convId), Action: -1 });
 }
 
 export function createLabel(wxId: string, labelName: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.UserLabelSetTask, { WxId: Number(wxId), LabelName: labelName });
+  return sendToJava("UserLabelSetTask", { WxId: Number(wxId), LabelName: labelName });
 }
 
 export function deleteLabel(wxId: string, labelId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.UserLabelDelTask, { WxId: Number(wxId), LabelId: Number(labelId) });
+  return sendToJava("UserLabelDelTask", { WxId: Number(wxId), LabelId: Number(labelId) });
 }
 
 export function modifyLabel(wxId: string, labelId: string, labelName: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.UserLabelModifyTask, { WxId: Number(wxId), LabelId: Number(labelId), LabelName: labelName });
+  return sendToJava("UserLabelModifyTask", { WxId: Number(wxId), LabelId: Number(labelId), LabelName: labelName });
 }
 
 export function setUserLabels(wxId: string, remoteId: string, labelIds: string[]): SendResult {
-  return sendToPhone(wxId, EnumMsgType.UserSetLabelTask, { WxId: Number(wxId), RemoteId: Number(remoteId), LabelIds: labelIds.map(Number) });
+  return sendToJava("UserSetLabelTask", { WxId: Number(wxId), RemoteId: Number(remoteId), LabelIds: labelIds.map(Number) });
 }
 
 export function triggerLabelSync(wxId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.TriggerUserLabelTask, { WxId: Number(wxId) });
+  return sendToJava("TriggerUserLabelTask", { WxId: Number(wxId) });
 }
 
 export function massSend(wxId: string, convIds: string[], content: string, contentType: string = "text"): SendResult {
-  return sendToPhone(wxId, EnumMsgType.QunFaTask, {
-    WxId: Number(wxId), ConvIds: convIds.map(Number), ContentType: contentTypeValue(contentType), Content: Buffer.from(content),
+  return sendToJava("QunFaTask", {
+    WxId: Number(wxId), ConvIds: convIds.map(Number), ContentType: contentTypeValue(contentType), Content: content,
   });
 }
 
@@ -192,46 +208,46 @@ export function massSend(wxId: string, convIds: string[], content: string, conte
 // ============================================
 
 export function postMoments(wxId: string, content: string, contentType: string = "text", mediaUrls?: string[], linkUrl?: string, linkTitle?: string, visibleList?: string[]): SendResult {
-  const p: Record<string, unknown> = { WxId: Number(wxId), ContentType: contentTypeValue(contentType), Content: Buffer.from(content) };
+  const p: Record<string, unknown> = { WxId: Number(wxId), ContentType: contentTypeValue(contentType), Content: content };
   if (mediaUrls) p.MediaUrls = mediaUrls;
   if (linkUrl) p.LinkUrl = linkUrl;
   if (linkTitle) p.LinkTitle = linkTitle;
   if (visibleList) p.VisibleList = visibleList.map(Number);
-  return sendToPhone(wxId, EnumMsgType.PostSnsTask, p);
+  return sendToJava("PostSnsTask", p);
 }
 
 export function postMomentsTask(wxId: string, taskId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.PostSnsTaskTask, { WxId: Number(wxId), TaskId: Number(taskId) });
+  return sendToJava("PostSnsTaskTask", { WxId: Number(wxId), TaskId: Number(taskId) });
 }
 
 export function getSnsData(wxId: string, snsId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.GetSnsDataTask, { WxId: Number(wxId), SnsId: Number(snsId) });
+  return sendToJava("GetSnsDataTask", { WxId: Number(wxId), SnsId: Number(snsId) });
 }
 
 export function pullMySns(wxId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.PullMySnsListTask, { WxId: Number(wxId) });
+  return sendToJava("PullMySnsListTask", { WxId: Number(wxId) });
 }
 
 export function pullSnsTaskList(wxId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.PullSnsTaskListTask, { WxId: Number(wxId) });
+  return sendToJava("PullSnsTaskListTask", { WxId: Number(wxId) });
 }
 
 export function snsComment(wxId: string, snsId: string, content: string, replyTo?: string): SendResult {
   const p: Record<string, unknown> = { WxId: Number(wxId), SnsId: Number(snsId), Content: content };
   if (replyTo) p.ReplyTo = Number(replyTo);
-  return sendToPhone(wxId, EnumMsgType.SnsCommentTask, p);
+  return sendToJava("SnsCommentTask", p);
 }
 
 export function snsLike(wxId: string, snsId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.SnsLikeTask, { WxId: Number(wxId), SnsId: Number(snsId) });
+  return sendToJava("SnsLikeTask", { WxId: Number(wxId), SnsId: Number(snsId) });
 }
 
 export function deleteSns(wxId: string, snsId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.DelSnsTask, { WxId: Number(wxId), SnsId: Number(snsId) });
+  return sendToJava("DelSnsTask", { WxId: Number(wxId), SnsId: Number(snsId) });
 }
 
 export function deleteSnsComment(wxId: string, snsId: string, commentId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.DelSnsCommentTask, { WxId: Number(wxId), SnsId: Number(snsId), CommentId: Number(commentId) });
+  return sendToJava("DelSnsCommentTask", { WxId: Number(wxId), SnsId: Number(snsId), CommentId: Number(commentId) });
 }
 
 // ============================================
@@ -239,31 +255,31 @@ export function deleteSnsComment(wxId: string, snsId: string, commentId: string)
 // ============================================
 
 export function phoneState(wxId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.PhoneStateTask, { WxId: Number(wxId) });
+  return sendToJava("PhoneStateTask", { WxId: Number(wxId) });
 }
 
 export function pullQrCode(wxId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.PullMyQrCodeTask, { WxId: Number(wxId) });
+  return sendToJava("PullMyQrCodeTask", { WxId: Number(wxId) });
 }
 
 export function downloadByUrl(wxId: string, url: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.DownloadFileByUrlTask, { WxId: Number(wxId), Url: url });
+  return sendToJava("DownloadFileByUrlTask", { WxId: Number(wxId), Url: url });
 }
 
 export function downloadByMsgId(wxId: string, msgId: string): SendResult {
-  return sendToPhone(wxId, EnumMsgType.DownloadFileByMsgIdTask, { WxId: Number(wxId), MsgId: Number(msgId) });
+  return sendToJava("DownloadFileByMsgIdTask", { WxId: Number(wxId), MsgId: Number(msgId) });
 }
 
 export function triggerSync(wxId: string, dataType: string): SendResult {
-  const typeMap: Record<string, number> = {
-    contacts: EnumMsgType.TriggerContactPushTask,
-    customers: EnumMsgType.TriggerCustomerPushTask,
-    conversations: EnumMsgType.TriggerConversationPushTask,
-    labels: EnumMsgType.TriggerUserLabelTask,
-    departments: EnumMsgType.TriggerContactPushTask,
-    wx_friends: EnumMsgType.TriggerWechatFriendPushTask,
-    all: EnumMsgType.TriggerAccountPushTask,
+  const typeMap: Record<string, string> = {
+    contacts: "TriggerContactPushTask",
+    customers: "TriggerCustomerPushTask",
+    conversations: "TriggerConversationPushTask",
+    labels: "TriggerUserLabelTask",
+    departments: "TriggerContactPushTask",
+    wx_friends: "TriggerWechatFriendPushTask",
+    all: "TriggerAccountPushTask",
   };
-  const mt = typeMap[dataType] ?? EnumMsgType.TriggerAccountPushTask;
-  return sendToPhone(wxId, mt, { WxId: Number(wxId) });
+  const mt = typeMap[dataType] ?? "TriggerAccountPushTask";
+  return sendToJava(mt, { WxId: Number(wxId) });
 }

@@ -14,8 +14,7 @@ import {
   markTaskDone,
   type ScheduledTask,
 } from "./storage-service.js";
-import { sendToPhone } from "./send-helper.js";
-import { EnumMsgType } from "../proto/codec.js";
+import { sendToJava } from "./send-helper.js";
 
 let _timer: ReturnType<typeof setInterval> | null = null;
 
@@ -107,17 +106,9 @@ function executeTask(
     return;
   }
 
-  // 解析 MsgType
+  // 发送指令 (通过 Java 后端 WS JSON 协议)
   const msgTypeName = task.msgType;
-  const msgType = EnumMsgType[msgTypeName as keyof typeof EnumMsgType];
-
-  if (msgType === undefined) {
-    log.error(`[Scheduler] 任务 ${task.id} 未知消息类型: ${msgTypeName}`);
-    return;
-  }
-
-  // 发送指令
-  const result = sendToPhone(task.wxId, msgType, payload);
+  const result = sendToJava(msgTypeName, payload);
   if (!result.success) {
     log.error(`[Scheduler] 任务 ${task.id} 发送失败: ${result.error}`);
   }

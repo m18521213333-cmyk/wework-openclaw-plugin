@@ -68,18 +68,16 @@ export function registerDeviceTools(api: OpenClawPluginApi) {
 
   api.registerTool(makeTool({
     name: "wework_list_devices",
-    description: "查看当前所有在线的企业微信设备和账号",
+    description: "查看当前 WS 客户端连接状态（方案B通过Java后端管理设备）",
     parameters: Type.Object({}),
     async execute() {
-      const server = getWeWorkServer();
-      if (!server) return { content: [{ type: "text" as const, text: "通信服务未启动" }], details: {}, isError: true };
+      const client = getWeWorkServer();
+      if (!client) return { content: [{ type: "text" as const, text: "通信服务未启动" }], details: {}, isError: true };
 
-      const users = server.connections.getOnlineUsers();
-      if (users.length === 0) {
-        return { content: [{ type: "text" as const, text: "当前无在线设备" }], details: {} };
-      }
-      const lines = users.map(u => `wxId=${u.wxId} device=${u.deviceId} protocol=${u.type} since=${u.connectedAt.toISOString()}`);
-      return { content: [{ type: "text" as const, text: `在线设备 ${users.length} 个:\n${lines.join("\n")}` }], details: {} };
+      const status = client.connected
+        ? "✅ 已连接 Java 后端（设备列表由 Java 后端管理）"
+        : "❌ 未连接 Java 后端";
+      return { content: [{ type: "text" as const, text: status }], details: {} };
     },
   }));
 }

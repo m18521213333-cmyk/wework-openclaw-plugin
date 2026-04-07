@@ -1,11 +1,15 @@
 /**
- * WeWork SCRM - OpenClaw Plugin (生产级)
+ * WeWork SCRM - OpenClaw Plugin (方案B: WS 客户端模式)
  *
- * 全部 7 个阶段，真正的 Protobuf 二进制协议，可直接部署。
- *   TCP  端口 → 手机SDK (Protobuf)
- *   WS   端口 → PC前端 (JSON)
- *   SQLite → 本地数据存储
- *   Dify  → AI 自动回复
+ * 通过 WebSocket 连接 Java 后端 (:15088)，使用 JSON 协议。
+ * 与原有 Web 管理端共存，同一个手机端，同一个后端，两个入口。
+ *
+ * 架构:
+ *   手机SDK ←→ Java后端 (TCP:15087) ←→ Web管理端 (HTTP:15086)
+ *                  ↕
+ *              Java WS (:15088)
+ *               ↕         ↕
+ *           PC前端     OpenClaw (本插件)
  */
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
@@ -18,10 +22,8 @@ import { registerGroupTools } from "./tools/group-tools.js";
 import { registerMomentsTools } from "./tools/moments-tools.js";
 import { registerDeviceTools } from "./tools/device-tools.js";
 
-// 通信 + 处理器
-import { getWeWorkServer } from "./services/websocket-service.js";
-import { registerBuiltinHandlers } from "./handlers/builtin-handlers.js";
-import { MessageRouter } from "./services/message-router.js";
+// WS 客户端
+import { getWeWorkClient } from "./services/websocket-service.js";
 
 // 自动化 + AI + 存储 + 调度
 import { getDb, closeDb } from "./services/storage-service.js";
@@ -29,8 +31,16 @@ import { handleAiReply } from "./services/dify-service.js";
 import { checkKeywordReply, checkAutoAcceptFriend, persistMessage } from "./services/automation-engine.js";
 import { startScheduler, stopScheduler } from "./services/scheduler-service.js";
 
+// send-helper (CLI 直接调用)
+import {
+  sendMessage, searchMessages, triggerHistoryMessages,
+  getContactInfo, triggerSync, phoneState,
+  chatRoomAction, massSend, postMoments, pullMySns,
+} from "./services/send-helper.js";
+
 const DEFAULT_CONFIG = {
-  websocket: { port: 15087, host: "0.0.0.0" },
+  /** Java 后端 WebSocket 地址 */
+  javaWsUrl: "ws://127.0.0.1:15088",
   storage: { type: "sqlite" as const, sqlitePath: "./wework-scrm.db" },
   dify: { enabled: false, apiUrl: "", apiKey: "" },
 };
@@ -38,115 +48,226 @@ const DEFAULT_CONFIG = {
 export default definePluginEntry({
   id: "wework-scrm",
   name: "WeWork SCRM",
-  description: "企业微信 SCRM 插件 — 消息/联系人/群聊/朋友圈/AI自动回复/定时任务",
+  description: "企业微信 SCRM 插件 — 通过 Java 后端 WS 协议操控消息/联系人/群聊/朋友圈",
 
   register(api: OpenClawPluginApi) {
     const logger = api.logger;
     const cfg = { ...DEFAULT_CONFIG, ...(api.config ?? {}) };
 
-    // 注册全部 Agent 工具
+    // 注册全部 Agent 工具 (36个)
     registerMessageTools(api);
     registerContactTools(api);
     registerGroupTools(api);
     registerMomentsTools(api);
     registerDeviceTools(api);
 
-    // 后台服务
+    // 后台服务: WS 客户端连接 Java 后端
     api.registerService({
-      id: "wework-comm-server",
+      id: "wework-ws-client",
 
       async start() {
         // 初始化 SQLite
         getDb(cfg.storage.sqlitePath);
         logger.info(`[Storage] SQLite: ${cfg.storage.sqlitePath}`);
 
-        // 启动通信服务
-        const server = getWeWorkServer(cfg.websocket);
+        // 连接 Java 后端 WS
+        const client = getWeWorkClient({ serverUrl: cfg.javaWsUrl });
 
-        server.on("log", (m: string) => logger.info(`[Server] ${m}`));
-        server.on("connection-error", (_c: unknown, e: Error) => logger.error(`[Server] ${e.message}`));
-        server.on("error", (e: Error) => logger.error(`[Server] ${e.message}`));
+        client.on("log", (m: string) => logger.info(`[WS] ${m}`));
+        client.on("error", (e: Error) => logger.error(`[WS] ${e.message}`));
 
-        // 创建消息路由器并注册内置处理器
-        const router = new MessageRouter(server);
-        registerBuiltinHandlers(router, server, logger);
+        client.on("connected", () => {
+          logger.info(`[Ready] 已连接 Java 后端 ${cfg.javaWsUrl}`);
+        });
 
-        // 绑定事件回调
-        const onEvent = async (name: string, data: Record<string, unknown>) => {
-          // === 消息事件 → 自动化处理链 ===
-          if (name === "wework:message") {
-            const d = data as {
-              wxId: string; convId: string; senderId: string; senderName: string;
-              content: string; contentType: number; msgId?: string | number; msgRemoteId?: string | number; createTime?: number;
-            };
+        // 接收 Java 后端推送的事件 (与 PC 前端收到的一样)
+        client.on("json-message", async (json: Record<string, unknown>) => {
+          try {
+            const msgType = json.MsgType as string;
+            const content = json.Content as Record<string, unknown> ?? {};
 
-            // 持久化消息
-            persistMessage({
-              wxId: d.wxId, convId: d.convId, senderId: d.senderId, senderName: d.senderName,
-              contentType: d.contentType, content: d.content, msgId: d.msgId,
-              msgRemoteId: d.msgRemoteId, isSend: "false", createTime: d.createTime,
-            });
+            // 消息通知 → 持久化 + 自动回复
+            if (msgType === "FriendTalkNotice") {
+              const d = content as {
+                WxId?: number; ConvId?: number; SenderId?: number; SenderName?: string;
+                Content?: string; ContentType?: number; MsgId?: number; MsgRemoteId?: number; CreateTime?: number;
+              };
 
-            // 关键词自动回复
-            const handled = checkKeywordReply(d.wxId, d.convId, d.content, d.contentType, logger);
+              persistMessage({
+                wxId: String(d.WxId ?? ""), convId: String(d.ConvId ?? ""),
+                senderId: String(d.SenderId ?? ""), senderName: d.SenderName ?? "",
+                contentType: d.ContentType ?? 0, content: d.Content ?? "",
+                msgId: d.MsgId, msgRemoteId: d.MsgRemoteId,
+                isSend: "false", createTime: d.CreateTime,
+              });
 
-            // Dify AI 回复
-            if (!handled && cfg.dify.enabled) {
-              await handleAiReply(d.wxId, d.convId, d.senderId, d.senderName, d.content,
-                { apiUrl: cfg.dify.apiUrl!, apiKey: cfg.dify.apiKey! }, logger);
+              const handled = checkKeywordReply(
+                String(d.WxId), String(d.ConvId), d.Content ?? "", d.ContentType ?? 0, logger,
+              );
+
+              if (!handled && cfg.dify.enabled) {
+                await handleAiReply(
+                  String(d.WxId), String(d.ConvId), String(d.SenderId), d.SenderName ?? "", d.Content ?? "",
+                  { apiUrl: cfg.dify.apiUrl!, apiKey: cfg.dify.apiKey! }, logger,
+                );
+              }
             }
-          }
 
-          // === 新客户 → 自动接受好友 ===
-          if (name === "wework:customer-added" || name === "wework:new-customer-push") {
-            const wxId = data.wxId as string;
-            const raw = data.raw as Record<string, unknown> | undefined;
-            const remoteId = String(raw?.RemoteId ?? raw?.remoteId ?? "");
-            if (remoteId && remoteId !== "0") {
-              checkAutoAcceptFriend(wxId, remoteId, logger);
+            // 新客户通知 → 自动接受
+            if (msgType === "CustomerAddNotice" || msgType === "NewCustomerPushNotice") {
+              const wxId = String(content.WxId ?? "");
+              const remoteId = String(content.RemoteId ?? "");
+              if (remoteId && remoteId !== "0") {
+                checkAutoAcceptFriend(wxId, remoteId, logger);
+              }
             }
-          }
-        };
 
-        // Listen for events emitted by the router
-        for (const event of ["wework:message", "wework:customer-added", "wework:new-customer-push"]) {
-          router.on(event, (data: Record<string, unknown>) => {
-            onEvent(event, data).catch((e: Error) => logger.error(`[Event] ${e.message}`));
-          });
-        }
+          } catch (e: any) {
+            logger.error(`[Event] ${e.message}`);
+          }
+        });
 
         // 启动定时任务调度
         startScheduler(logger);
 
-        // 启动网络服务
-        await server.start();
-        const p = cfg.websocket.port;
-        logger.info(`[Ready] TCP=${p}(Protobuf) WS=${p + 1}(JSON) SQLite=${cfg.storage.sqlitePath}`);
+        // 连接
+        await client.start();
       },
 
       async stop() {
         stopScheduler();
-        const s = getWeWorkServer();
-        if (s) await s.stop();
+        const c = getWeWorkClient();
+        if (c) await c.stop();
         closeDb();
         logger.info("[Stopped]");
       },
     });
 
-    // CLI
+    // ============================================
+    // CLI 插件: openclaw wework <command>
+    // ============================================
     api.registerCli(({ program }: { program: any }) => {
-      const ww = program.command("wework").description("WeWork SCRM");
-      ww.command("status").description("连接状态").action(() => {
-        const s = getWeWorkServer();
-        if (!s) { console.log("未启动"); return; }
-        const c = s.connections;
-        console.log(`设备: ${c.deviceCount}  用户: ${c.userCount}`);
-        for (const u of c.getOnlineUsers()) {
-          console.log(`  ${u.wxId} (${u.type}) device=${u.deviceId} since=${u.connectedAt.toISOString()}`);
-        }
+      const ww = program.command("wework").description("WeWork SCRM 管理");
+
+      // --- 状态 ---
+      ww.command("status").description("查看连接状态").action(() => {
+        const c = getWeWorkClient();
+        if (!c) { console.log("插件未启动"); return; }
+        console.log(`Java 后端: ${c.connected ? "✅ 已连接" : "❌ 未连接"} (${cfg.javaWsUrl})`);
       });
+
+      // --- 发消息 ---
+      ww.command("send")
+        .description("发送消息")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<convId>", "目标会话ID")
+        .argument("<message>", "消息内容")
+        .option("-t, --type <type>", "消息类型: text/image/file/link", "text")
+        .action((wxId: string, convId: string, message: string, opts: { type: string }) => {
+          const r = sendMessage(wxId, convId, message, opts.type);
+          console.log(r.success ? `✅ 消息已发送 → ${convId}` : `❌ ${r.error}`);
+        });
+
+      // --- 搜索消息 ---
+      ww.command("search")
+        .description("搜索历史消息")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<keyword>", "搜索关键词")
+        .option("-c, --conv <convId>", "限定会话")
+        .action((wxId: string, keyword: string, opts: { conv?: string }) => {
+          const r = searchMessages(wxId, keyword, opts.conv);
+          console.log(r.success ? `✅ 搜索指令已发送: "${keyword}"` : `❌ ${r.error}`);
+        });
+
+      // --- 历史消息 ---
+      ww.command("history")
+        .description("拉取历史消息")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<convId>", "会话ID")
+        .option("-n, --count <n>", "条数", "50")
+        .action((wxId: string, convId: string, opts: { count: string }) => {
+          const r = triggerHistoryMessages(wxId, convId, parseInt(opts.count));
+          console.log(r.success ? `✅ 拉取 ${opts.count} 条历史消息` : `❌ ${r.error}`);
+        });
+
+      // --- 联系人信息 ---
+      ww.command("contact")
+        .description("查询联系人")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<remoteId>", "联系人ID")
+        .action((wxId: string, remoteId: string) => {
+          const r = getContactInfo(wxId, remoteId);
+          console.log(r.success ? `✅ 查询已发送: ${remoteId}` : `❌ ${r.error}`);
+        });
+
+      // --- 群发 ---
+      ww.command("mass-send")
+        .description("群发消息")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<message>", "消息内容")
+        .option("-t, --type <type>", "消息类型", "text")
+        .option("--to <ids...>", "目标会话ID列表")
+        .action((wxId: string, message: string, opts: { type: string; to: string[] }) => {
+          if (!opts.to?.length) { console.log("❌ 请指定 --to <会话ID列表>"); return; }
+          const r = massSend(wxId, opts.to, message, opts.type);
+          console.log(r.success ? `✅ 群发 → ${opts.to.length} 个会话` : `❌ ${r.error}`);
+        });
+
+      // --- 群聊操作 ---
+      ww.command("group")
+        .description("群聊管理")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<action>", "操作: create/add_member/remove_member/set_name/set_notice/quit")
+        .option("-g, --group <convId>", "群会话ID")
+        .option("-m, --members <ids...>", "成员ID列表")
+        .option("-c, --content <text>", "群名/公告内容")
+        .action((wxId: string, action: string, opts: { group?: string; members?: string[]; content?: string }) => {
+          const r = chatRoomAction(wxId, action, opts.group, opts.members, opts.content);
+          console.log(r.success ? `✅ 群操作 ${action} 已发送` : `❌ ${r.error}`);
+        });
+
+      // --- 发朋友圈 ---
+      ww.command("moments")
+        .description("发布朋友圈")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<content>", "文字内容")
+        .option("-t, --type <type>", "类型: text/image/video/link", "text")
+        .option("--media <urls...>", "图片/视频URL")
+        .action((wxId: string, content: string, opts: { type: string; media?: string[] }) => {
+          const r = postMoments(wxId, content, opts.type, opts.media);
+          console.log(r.success ? "✅ 朋友圈发布指令已发送" : `❌ ${r.error}`);
+        });
+
+      // --- 查看朋友圈 ---
+      ww.command("my-moments")
+        .description("拉取我的朋友圈")
+        .argument("<wxId>", "企业微信ID")
+        .action((wxId: string) => {
+          const r = pullMySns(wxId);
+          console.log(r.success ? "✅ 朋友圈列表拉取已发送" : `❌ ${r.error}`);
+        });
+
+      // --- 同步数据 ---
+      ww.command("sync")
+        .description("触发数据同步")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<type>", "类型: contacts/customers/conversations/labels/all")
+        .action((wxId: string, type: string) => {
+          const r = triggerSync(wxId, type);
+          console.log(r.success ? `✅ ${type} 同步已发送` : `❌ ${r.error}`);
+        });
+
+      // --- 手机状态 ---
+      ww.command("phone")
+        .description("查询手机状态")
+        .argument("<wxId>", "企业微信ID")
+        .action((wxId: string) => {
+          const r = phoneState(wxId);
+          console.log(r.success ? "✅ 手机状态查询已发送" : `❌ ${r.error}`);
+        });
+
     }, { commands: ["wework"] });
 
-    logger.info("[wework-scrm] 注册完成: 36工具 + Protobuf通信 + 自动化 + AI + 定时任务");
+    logger.info("[wework-scrm] 注册完成: 36 Agent工具 + CLI命令 + WS客户端模式 (→ Java后端)");
   },
 });
