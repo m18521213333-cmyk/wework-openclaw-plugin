@@ -24,7 +24,7 @@ let _timer: ReturnType<typeof setInterval> | null = null;
  * 每 60 秒检查一次待执行任务
  */
 export function startScheduler(
-  logger?: { info: (...a: unknown[]) => void; error: (...a: unknown[]) => void },
+  logger?: { info: (message: string) => void; error: (message: string) => void },
 ): void {
   const log = logger ?? { info: console.log, error: console.error };
 
@@ -71,7 +71,7 @@ export function stopScheduler(): void {
  *   4. 标记为已完成
  */
 function executePendingTasks(
-  log: { info: (...a: unknown[]) => void; error: (...a: unknown[]) => void },
+  log: { info: (message: string) => void; error: (message: string) => void },
 ): void {
   const tasks = getPendingTasks();
   if (tasks.length === 0) return;
@@ -96,7 +96,7 @@ function executePendingTasks(
  */
 function executeTask(
   task: ScheduledTask,
-  log: { info: (...a: unknown[]) => void; error: (...a: unknown[]) => void },
+  log: { info: (message: string) => void; error: (message: string) => void },
 ): void {
   // 解析 payload
   let payload: Record<string, unknown>;

@@ -42,7 +42,7 @@ export async function handleAiReply(
   senderName: string,
   content: string,
   globalDifyConfig?: DifyConfig,
-  logger?: { info: (...a: unknown[]) => void; error: (...a: unknown[]) => void },
+  logger?: { info: (message: string) => void; error: (message: string) => void },
 ): Promise<void> {
   const log = logger ?? { info: console.log, error: console.error };
 

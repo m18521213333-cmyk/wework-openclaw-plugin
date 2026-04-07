@@ -4,35 +4,36 @@
 
 import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { phoneStatus, pullQrCode, downloadFileByUrl, downloadFileByMsgId, triggerSync } from "../services/send-helper.js";
+import { phoneState, pullQrCode, downloadByUrl, downloadByMsgId, triggerSync } from "../services/send-helper.js";
 import { getWeWorkServer } from "../services/websocket-service.js";
 import type { SendResult } from "../services/send-helper.js";
+import { makeTool, type ToolResult } from "../openclaw-compat.js";
 
-function toResult(r: SendResult, ok: string) {
-  if (r.success) return { content: [{ type: "text" as const, text: `${ok} (taskId=${r.taskId})` }] };
-  return { content: [{ type: "text" as const, text: `操作失败: ${r.error}` }], isError: true };
+function toResult(r: SendResult, ok: string): ToolResult {
+  if (r.success) return { content: [{ type: "text" as const, text: ok }], details: {} };
+  return { content: [{ type: "text" as const, text: `操作失败: ${r.error}` }], details: {}, isError: true };
 }
 
 export function registerDeviceTools(api: OpenClawPluginApi) {
-  api.registerTool({
+  api.registerTool(makeTool({
     name: "wework_phone_status",
     description: "获取绑定手机的运行状态（电量、网络、存储等）",
     parameters: Type.Object({ wxId: Type.String({ description: "企业微信ID" }) }),
     async execute(_id, params) {
-      return toResult(phoneStatus(params.wxId), "手机状态查询已发送");
+      return toResult(phoneState(params.wxId), "手机状态查询已发送");
     },
-  });
+  }));
 
-  api.registerTool({
+  api.registerTool(makeTool({
     name: "wework_get_qrcode",
     description: "获取企业微信个人二维码",
     parameters: Type.Object({ wxId: Type.String({ description: "企业微信ID" }) }),
     async execute(_id, params) {
       return toResult(pullQrCode(params.wxId), "二维码获取指令已发送");
     },
-  });
+  }));
 
-  api.registerTool({
+  api.registerTool(makeTool({
     name: "wework_download_file",
     description: "下载聊天中的文件/图片/视频附件",
     parameters: Type.Object({
@@ -42,15 +43,15 @@ export function registerDeviceTools(api: OpenClawPluginApi) {
     }),
     async execute(_id, params) {
       if (params.fileUrl) {
-        return toResult(downloadFileByUrl(params.wxId, params.fileUrl), "URL下载指令已发送");
+        return toResult(downloadByUrl(params.wxId, params.fileUrl), "URL下载指令已发送");
       } else if (params.msgId) {
-        return toResult(downloadFileByMsgId(params.wxId, params.msgId), "消息附件下载指令已发送");
+        return toResult(downloadByMsgId(params.wxId, params.msgId), "消息附件下载指令已发送");
       }
-      return { content: [{ type: "text" as const, text: "请提供 msgId 或 fileUrl" }], isError: true };
+      return { content: [{ type: "text" as const, text: "请提供 msgId 或 fileUrl" }], details: {}, isError: true };
     },
-  });
+  }));
 
-  api.registerTool({
+  api.registerTool(makeTool({
     name: "wework_sync_data",
     description: "触发数据同步：联系人、客户、会话、标签等",
     parameters: Type.Object({
@@ -63,22 +64,22 @@ export function registerDeviceTools(api: OpenClawPluginApi) {
     async execute(_id, params) {
       return toResult(triggerSync(params.wxId, params.dataType), `${params.dataType} 同步指令已发送`);
     },
-  });
+  }));
 
-  api.registerTool({
+  api.registerTool(makeTool({
     name: "wework_list_devices",
     description: "查看当前所有在线的企业微信设备和账号",
     parameters: Type.Object({}),
     async execute() {
       const server = getWeWorkServer();
-      if (!server) return { content: [{ type: "text" as const, text: "通信服务未启动" }], isError: true };
+      if (!server) return { content: [{ type: "text" as const, text: "通信服务未启动" }], details: {}, isError: true };
 
       const users = server.connections.getOnlineUsers();
       if (users.length === 0) {
-        return { content: [{ type: "text" as const, text: "当前无在线设备" }] };
+        return { content: [{ type: "text" as const, text: "当前无在线设备" }], details: {} };
       }
-      const lines = users.map(u => `wxId=${u.wxId} device=${u.deviceId} protocol=${u.protocol} since=${u.connectedAt.toISOString()}`);
-      return { content: [{ type: "text" as const, text: `在线设备 ${users.length} 个:\n${lines.join("\n")}` }] };
+      const lines = users.map(u => `wxId=${u.wxId} device=${u.deviceId} protocol=${u.type} since=${u.connectedAt.toISOString()}`);
+      return { content: [{ type: "text" as const, text: `在线设备 ${users.length} 个:\n${lines.join("\n")}` }], details: {} };
     },
-  });
+  }));
 }

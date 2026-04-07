@@ -9,6 +9,7 @@
  */
 
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 
 // 工具注册
 import { registerMessageTools } from "./tools/message-tools.js";
@@ -20,6 +21,7 @@ import { registerDeviceTools } from "./tools/device-tools.js";
 // 通信 + 处理器
 import { getWeWorkServer } from "./services/websocket-service.js";
 import { registerBuiltinHandlers } from "./handlers/builtin-handlers.js";
+import { MessageRouter } from "./services/message-router.js";
 
 // 自动化 + AI + 存储 + 调度
 import { getDb, closeDb } from "./services/storage-service.js";
@@ -38,7 +40,7 @@ export default definePluginEntry({
   name: "WeWork SCRM",
   description: "企业微信 SCRM 插件 — 消息/联系人/群聊/朋友圈/AI自动回复/定时任务",
 
-  register(api) {
+  register(api: OpenClawPluginApi) {
     const logger = api.logger;
     const cfg = { ...DEFAULT_CONFIG, ...(api.config ?? {}) };
 
@@ -52,7 +54,6 @@ export default definePluginEntry({
     // 后台服务
     api.registerService({
       id: "wework-comm-server",
-      name: "WeWork Communication Server",
 
       async start() {
         // 初始化 SQLite
@@ -66,13 +67,17 @@ export default definePluginEntry({
         server.on("connection-error", (_c: unknown, e: Error) => logger.error(`[Server] ${e.message}`));
         server.on("error", (e: Error) => logger.error(`[Server] ${e.message}`));
 
-        // 注册消息处理器 + 事件回调
-        registerBuiltinHandlers(server, logger, async (name, data) => {
+        // 创建消息路由器并注册内置处理器
+        const router = new MessageRouter(server);
+        registerBuiltinHandlers(router, server, logger);
+
+        // 绑定事件回调
+        const onEvent = async (name: string, data: Record<string, unknown>) => {
           // === 消息事件 → 自动化处理链 ===
           if (name === "wework:message") {
             const d = data as {
               wxId: string; convId: string; senderId: string; senderName: string;
-              content: string; contentType: number; msgId?: unknown; msgRemoteId?: unknown; createTime?: number;
+              content: string; contentType: number; msgId?: string | number; msgRemoteId?: string | number; createTime?: number;
             };
 
             // 持久化消息
@@ -101,7 +106,14 @@ export default definePluginEntry({
               checkAutoAcceptFriend(wxId, remoteId, logger);
             }
           }
-        });
+        };
+
+        // Listen for events emitted by the router
+        for (const event of ["wework:message", "wework:customer-added", "wework:new-customer-push"]) {
+          router.on(event, (data: Record<string, unknown>) => {
+            onEvent(event, data).catch((e: Error) => logger.error(`[Event] ${e.message}`));
+          });
+        }
 
         // 启动定时任务调度
         startScheduler(logger);
@@ -122,7 +134,7 @@ export default definePluginEntry({
     });
 
     // CLI
-    api.registerCli(({ program }) => {
+    api.registerCli(({ program }: { program: any }) => {
       const ww = program.command("wework").description("WeWork SCRM");
       ww.command("status").description("连接状态").action(() => {
         const s = getWeWorkServer();
@@ -130,7 +142,7 @@ export default definePluginEntry({
         const c = s.connections;
         console.log(`设备: ${c.deviceCount}  用户: ${c.userCount}`);
         for (const u of c.getOnlineUsers()) {
-          console.log(`  ${u.wxId} (${u.protocol}) device=${u.deviceId} since=${u.connectedAt.toISOString()}`);
+          console.log(`  ${u.wxId} (${u.type}) device=${u.deviceId} since=${u.connectedAt.toISOString()}`);
         }
       });
     }, { commands: ["wework"] });

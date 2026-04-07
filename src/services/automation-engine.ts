@@ -45,7 +45,7 @@ export function checkKeywordReply(
   convId: string,
   messageContent: string,
   contentType: number,
-  logger?: { info: (...a: unknown[]) => void },
+  logger?: { info: (message: string) => void },
 ): boolean {
   const log = logger ?? { info: console.log };
 
@@ -160,7 +160,7 @@ function simpleSimilarity(a: string, b: string): number {
 export function checkAutoAcceptFriend(
   wxId: string,
   remoteId: string,
-  logger?: { info: (...a: unknown[]) => void },
+  logger?: { info: (message: string) => void },
 ): boolean {
   const log = logger ?? { info: console.log };
 

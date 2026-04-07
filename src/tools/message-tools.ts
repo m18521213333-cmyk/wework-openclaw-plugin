@@ -31,26 +31,19 @@ import {
   triggerHistoryMessages,
 } from "../services/send-helper.js";
 import type { SendResult } from "../services/send-helper.js";
+import { makeTool, type ToolResult } from "../openclaw-compat.js";
 
 /** 把 SendResult 转为 OpenClaw Tool 的标准返回格式 */
-function toToolResult(result: SendResult, successMsg: string) {
+function toToolResult(result: SendResult, successMsg: string): ToolResult {
   if (result.success) {
     return {
-      content: [
-        {
-          type: "text" as const,
-          text: `${successMsg} (taskId=${result.taskId})`,
-        },
-      ],
+      content: [{ type: "text" as const, text: successMsg }],
+      details: {},
     };
   } else {
     return {
-      content: [
-        {
-          type: "text" as const,
-          text: `操作失败: ${result.error}`,
-        },
-      ],
+      content: [{ type: "text" as const, text: `操作失败: ${result.error}` }],
+      details: {},
       isError: true,
     };
   }
@@ -66,7 +59,7 @@ export function registerMessageTools(api: OpenClawPluginApi) {
   //      → 通过 wxId 找到手机端通道 → 转发 protobuf 消息
   //      → 回复发送方 MsgReceivedAck
   // --------------------------------------------------
-  api.registerTool({
+  api.registerTool(makeTool({
     name: "wework_send_message",
     description:
       "发送企业微信消息给指定联系人或群聊。支持文本、图片、文件、链接、小程序等类型。",
@@ -113,14 +106,14 @@ export function registerMessageTools(api: OpenClawPluginApi) {
         `消息已发送到会话 ${params.convId}（类型: ${typeLabel}）`,
       );
     },
-  });
+  }));
 
   // --------------------------------------------------
   // 3.3 撤回消息 (对应 MsgRevokeTask)
   //
   // 原逻辑: 解析 MsgRevokeTaskMessage → msgSend2Phone
   // --------------------------------------------------
-  api.registerTool({
+  api.registerTool(makeTool({
     name: "wework_revoke_message",
     description: "撤回已发送的企业微信消息",
     parameters: Type.Object({
@@ -132,7 +125,7 @@ export function registerMessageTools(api: OpenClawPluginApi) {
       const result = revokeMessage(params.wxId, params.msgId, params.convId);
       return toToolResult(result, `消息 ${params.msgId} 已撤回`);
     },
-  });
+  }));
 
   // --------------------------------------------------
   // 3.4 转发消息 (对应 ForwardMsgTask + ForwardMultiTask)
@@ -145,7 +138,7 @@ export function registerMessageTools(api: OpenClawPluginApi) {
   //   单个 msgId → ForwardMsgTask
   //   多个 msgId (逗号分隔) → ForwardMultiTask
   // --------------------------------------------------
-  api.registerTool({
+  api.registerTool(makeTool({
     name: "wework_forward_message",
     description:
       "将消息转发到其他会话。支持单条转发和多条合并转发（多个消息ID用逗号分隔）",
@@ -158,7 +151,7 @@ export function registerMessageTools(api: OpenClawPluginApi) {
       toConvId: Type.String({ description: "目标会话ID" }),
     }),
     async execute(_id, params) {
-      const msgIds = params.msgId.split(",").map((s) => s.trim());
+      const msgIds = params.msgId.split(",").map((s: string) => s.trim());
 
       let result: SendResult;
       if (msgIds.length === 1) {
@@ -184,7 +177,7 @@ export function registerMessageTools(api: OpenClawPluginApi) {
         `${msgIds.length}条消息已转发到会话 ${params.toConvId}`,
       );
     },
-  });
+  }));
 
   // --------------------------------------------------
   // 3.5 搜索消息 (对应 SearchMsgTask)
@@ -195,7 +188,7 @@ export function registerMessageTools(api: OpenClawPluginApi) {
   // 注意: 这是一个异步操作，Tool 返回的是"指令已发送"，
   // 搜索结果会通过事件推送回来。后续可以扩展为等待结果的模式。
   // --------------------------------------------------
-  api.registerTool({
+  api.registerTool(makeTool({
     name: "wework_search_messages",
     description:
       "在指定会话中搜索历史消息。搜索指令发送后，结果将通过事件推送返回。",
@@ -218,7 +211,7 @@ export function registerMessageTools(api: OpenClawPluginApi) {
         `搜索指令已发送，关键词: "${params.keyword}"，结果将异步推送`,
       );
     },
-  });
+  }));
 
   // --------------------------------------------------
   // 3.6 获取历史消息 (对应 TriggerHistoryMsgPushTask)
@@ -228,7 +221,7 @@ export function registerMessageTools(api: OpenClawPluginApi) {
   //
   // 与搜索消息类似，这是异步操作。
   // --------------------------------------------------
-  api.registerTool({
+  api.registerTool(makeTool({
     name: "wework_get_history",
     description:
       "获取指定会话的历史聊天记录。指令发送后，历史消息将通过事件推送返回。",
@@ -256,5 +249,5 @@ export function registerMessageTools(api: OpenClawPluginApi) {
         `历史消息拉取指令已发送，会话 ${params.convId}，请求 ${params.count ?? 50} 条`,
       );
     },
-  });
+  }));
 }

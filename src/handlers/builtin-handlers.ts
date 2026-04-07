@@ -10,8 +10,8 @@ import type { WeWorkServer } from "../services/websocket-service.js";
 import type { MessageRouter, InternalMessage } from "../services/message-router.js";
 
 type Logger = {
-  info: (...args: unknown[]) => void;
-  error: (...args: unknown[]) => void;
+  info: (message: string) => void;
+  error: (message: string) => void;
 };
 
 /** 从 content 兼容取值 */
