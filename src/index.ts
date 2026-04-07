@@ -40,7 +40,7 @@ import {
 
 const DEFAULT_CONFIG = {
   /** Java 后端 WebSocket 地址 */
-  javaWsUrl: "ws://127.0.0.1:15088",
+  javaWsUrl: "ws://60.205.94.161:15088",
   storage: { type: "sqlite" as const, sqlitePath: "./wework-scrm.db" },
   dify: { enabled: false, apiUrl: "", apiKey: "" },
 };
