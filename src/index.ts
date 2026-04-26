@@ -30,6 +30,7 @@ import { getDb, closeDb } from "./services/storage-service.js";
 import { handleAiReply } from "./services/dify-service.js";
 import { checkKeywordReply, checkAutoAcceptFriend, persistMessage } from "./services/automation-engine.js";
 import { startScheduler, stopScheduler } from "./services/scheduler-service.js";
+import { initDevPipeline, getDevPipeline } from "./services/dev-pipeline.js";
 
 // send-helper (CLI 直接调用)
 import {
@@ -43,6 +44,16 @@ const DEFAULT_CONFIG = {
   javaWsUrl: "ws://60.205.94.161:15088",
   storage: { type: "sqlite" as const, sqlitePath: "./wework-scrm.db" },
   dify: { enabled: false, apiUrl: "", apiKey: "" },
+  /** 6-Agent 自动开发流水线 */
+  devPipeline: {
+    enabled: false,
+    gatewayUrl: "http://127.0.0.1:8080",
+    gatewayToken: "",
+    projectsDir: `${process.env.HOME ?? "."}/wework-projects`,
+    triggerKeywords: ["@开发助手", "@dev", "/dev", "我想做一个", "帮我开发"],
+    /** 可选: 用本地 Claude Code CLI 替代 OpenClaw HTTP, 留空则用 Gateway HTTP */
+    claudeCliPath: "",
+  },
 };
 
 export default definePluginEntry({
@@ -69,6 +80,20 @@ export default definePluginEntry({
         // 初始化 SQLite
         getDb(cfg.storage.sqlitePath);
         logger.info(`[Storage] SQLite: ${cfg.storage.sqlitePath}`);
+
+        // 初始化 6-Agent 开发流水线
+        if (cfg.devPipeline.enabled) {
+          initDevPipeline({
+            enabled: true,
+            gatewayUrl: cfg.devPipeline.gatewayUrl,
+            gatewayToken: cfg.devPipeline.gatewayToken || undefined,
+            projectsDir: cfg.devPipeline.projectsDir,
+            triggerKeywords: cfg.devPipeline.triggerKeywords,
+            claudeCliPath: cfg.devPipeline.claudeCliPath || undefined,
+          }, logger);
+          logger.info(`[DevPipeline] 已启用, 触发词: ${cfg.devPipeline.triggerKeywords.join(", ")}`);
+          logger.info(`[DevPipeline] 项目目录: ${cfg.devPipeline.projectsDir}`);
+        }
 
         // 连接 Java 后端 WS
         const client = getWeWorkClient({ serverUrl: cfg.javaWsUrl });
@@ -105,7 +130,19 @@ export default definePluginEntry({
                 String(d.WxId), String(d.ConvId), d.Content ?? "", d.ContentType ?? 0, logger,
               );
 
-              if (!handled && cfg.dify.enabled) {
+              // 检查是否触发 6-Agent 自动开发流水线
+              const pipeline = getDevPipeline();
+              if (pipeline && pipeline.shouldTrigger(d.Content ?? "")) {
+                logger.info(`[DevPipeline] 触发: from=${d.SenderName}, content="${(d.Content ?? "").slice(0, 60)}..."`);
+                // 异步执行,不阻塞消息处理
+                pipeline.execute({
+                  wxId: String(d.WxId ?? ""),
+                  convId: String(d.ConvId ?? ""),
+                  senderId: String(d.SenderId ?? ""),
+                  senderName: d.SenderName ?? "",
+                  requirement: d.Content ?? "",
+                }).catch((err) => logger.error(`[DevPipeline] 执行失败: ${err.message}`));
+              } else if (!handled && cfg.dify.enabled) {
                 await handleAiReply(
                   String(d.WxId), String(d.ConvId), String(d.SenderId), d.SenderName ?? "", d.Content ?? "",
                   { apiUrl: cfg.dify.apiUrl!, apiKey: cfg.dify.apiKey! }, logger,
@@ -306,8 +343,46 @@ export default definePluginEntry({
           console.log(r.success ? "✅ 手机状态查询已发送" : `❌ ${r.error}`);
         }));
 
+      // --- 6-Agent 开发流水线 (手动触发) ---
+      ww.command("dev")
+        .description("手动触发 6-Agent 自动开发流水线 (用于测试)")
+        .argument("<wxId>", "发起方企业微信ID")
+        .argument("<convId>", "目标客户会话ID (用于回传结果)")
+        .argument("<requirement>", "需求描述")
+        .option("--sender <id>", "客户ID", "test-sender")
+        .option("--name <name>", "客户姓名", "测试用户")
+        .action(async (wxId: string, convId: string, requirement: string, opts: { sender: string; name: string }) => {
+          // 初始化流水线 (如果还没启用,使用默认配置临时启动)
+          let pipeline = getDevPipeline();
+          if (!pipeline) {
+            pipeline = initDevPipeline({
+              enabled: true,
+              gatewayUrl: cfg.devPipeline.gatewayUrl,
+              gatewayToken: cfg.devPipeline.gatewayToken || undefined,
+              projectsDir: cfg.devPipeline.projectsDir,
+              triggerKeywords: cfg.devPipeline.triggerKeywords,
+              claudeCliPath: cfg.devPipeline.claudeCliPath || undefined,
+            });
+            console.log(`[DevPipeline] 临时启动 (项目目录: ${cfg.devPipeline.projectsDir})`);
+          }
+
+          if (!await ensureConnected()) return;
+          try {
+            console.log(`🚀 启动开发流水线: "${requirement.slice(0, 60)}..."`);
+            await pipeline.execute({
+              wxId, convId,
+              senderId: opts.sender,
+              senderName: opts.name,
+              requirement,
+            });
+            console.log("✅ 流水线执行完成");
+          } finally {
+            await cleanupConnection();
+          }
+        });
+
     }, { commands: ["wework"] });
 
-    logger.info("[wework-scrm] 注册完成: 36 Agent工具 + CLI命令 + WS客户端模式 (→ Java后端)");
+    logger.info("[wework-scrm] 注册完成: 36 Agent工具 + CLI(含dev流水线) + WS客户端模式 (→ Java后端)");
   },
 });
