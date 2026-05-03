@@ -30,30 +30,42 @@ import { getDb, closeDb } from "./services/storage-service.js";
 import { handleAiReply } from "./services/dify-service.js";
 import { checkKeywordReply, checkAutoAcceptFriend, persistMessage } from "./services/automation-engine.js";
 import { startScheduler, stopScheduler } from "./services/scheduler-service.js";
-import { initDevPipeline, getDevPipeline } from "./services/dev-pipeline.js";
 
 // send-helper (CLI 直接调用)
 import {
-  sendMessage, searchMessages, triggerHistoryMessages,
+  sendMessage, revokeMessage, forwardMessage,
+  searchMessages, triggerHistoryMessages,
   getContactInfo, triggerSync, phoneState,
   chatRoomAction, massSend, postMoments, pullMySns,
+  waitTaskResult,
 } from "./services/send-helper.js";
 
+// node 内置: HTTP 上传 (wework upload 用)
+import * as fs from "node:fs";
+import * as path from "node:path";
+
 const DEFAULT_CONFIG = {
-  /** Java 后端 WebSocket 地址 */
-  javaWsUrl: "ws://60.205.94.161:15088",
+  /** Java 后端 WebSocket 地址 (默认走本机 loopback;
+   *  跨机部署时通过 ~/.openclaw/openclaw.json 的 plugins.entries.wework-scrm.config.javaWsUrl 覆盖) */
+  javaWsUrl: "ws://127.0.0.1:15088",
+  /**
+   * 必须配认证, 否则 Java 后端不会向我们这条 WS 推送任何业务消息
+   * (Java 端 msgSend2pc 只对认证过的连接广播).
+   * 在 ~/.openclaw/openclaw.json 的 plugins.entries.wework-scrm.config.auth 里设:
+   *   "auth": { "username": "pluginbot", "password": "xxx",
+   *             "cliUsername": "pluginbot-cli", "cliPassword": "yyy" }
+   * cliUsername/cliPassword 是 CLI 命令专用账号 — 跟 service 用不同账号,
+   * 避免 CLI 调用 squeeze 现有 service 的 WS 连接 (Java 端按 account 名互斥).
+   */
+  auth: {
+    authType: 2 as 2 | 3,
+    username: "",
+    password: "",
+    cliUsername: "",
+    cliPassword: "",
+  },
   storage: { type: "sqlite" as const, sqlitePath: "./wework-scrm.db" },
   dify: { enabled: false, apiUrl: "", apiKey: "" },
-  /** 6-Agent 自动开发流水线 */
-  devPipeline: {
-    enabled: false,
-    gatewayUrl: "http://127.0.0.1:8080",
-    gatewayToken: "",
-    projectsDir: `${process.env.HOME ?? "."}/wework-projects`,
-    triggerKeywords: ["@开发助手", "@dev", "/dev", "我想做一个", "帮我开发"],
-    /** 可选: 用本地 Claude Code CLI 替代 OpenClaw HTTP, 留空则用 Gateway HTTP */
-    claudeCliPath: "",
-  },
 };
 
 export default definePluginEntry({
@@ -63,7 +75,26 @@ export default definePluginEntry({
 
   register(api: OpenClawPluginApi) {
     const logger = api.logger;
-    const cfg = { ...DEFAULT_CONFIG, ...(api.config ?? {}) };
+
+    // 仅在 systemd openclaw-scrm.service 中启动 (Environment=WEWORK_PLUGIN_ENABLE=1).
+    // 其他 openclaw 进程 (默认 gateway / 手动 ssh / cron 等) 加载插件时直接 noop,
+    // 避免多个 openclaw 同时用 pluginbot 登录 Java 后端互相 squeeze.
+    if (process.env.WEWORK_PLUGIN_ENABLE !== "1") {
+      logger.info("[wework-scrm] 跳过加载 (没有 WEWORK_PLUGIN_ENABLE=1)");
+      return;
+    }
+
+    // OpenClaw SDK 的 api.config 是整个 ~/.openclaw/openclaw.json 的内容,
+    // 插件自己的 config 在 plugins.entries["wework-scrm"].config 里, 要手动取
+    const wholeCfg = (api.config ?? {}) as Record<string, any>;
+    const pluginCfg = wholeCfg?.plugins?.entries?.["wework-scrm"]?.config ?? {};
+    const cfg = {
+      ...DEFAULT_CONFIG,
+      ...pluginCfg,
+      auth: { ...DEFAULT_CONFIG.auth, ...(pluginCfg.auth ?? {}) },
+      storage: { ...DEFAULT_CONFIG.storage, ...(pluginCfg.storage ?? {}) },
+      dify: { ...DEFAULT_CONFIG.dify, ...(pluginCfg.dify ?? {}) },
+    };
 
     // 注册全部 Agent 工具 (36个)
     registerMessageTools(api);
@@ -81,22 +112,17 @@ export default definePluginEntry({
         getDb(cfg.storage.sqlitePath);
         logger.info(`[Storage] SQLite: ${cfg.storage.sqlitePath}`);
 
-        // 初始化 6-Agent 开发流水线
-        if (cfg.devPipeline.enabled) {
-          initDevPipeline({
-            enabled: true,
-            gatewayUrl: cfg.devPipeline.gatewayUrl,
-            gatewayToken: cfg.devPipeline.gatewayToken || undefined,
-            projectsDir: cfg.devPipeline.projectsDir,
-            triggerKeywords: cfg.devPipeline.triggerKeywords,
-            claudeCliPath: cfg.devPipeline.claudeCliPath || undefined,
-          }, logger);
-          logger.info(`[DevPipeline] 已启用, 触发词: ${cfg.devPipeline.triggerKeywords.join(", ")}`);
-          logger.info(`[DevPipeline] 项目目录: ${cfg.devPipeline.projectsDir}`);
-        }
+        // 连接 Java 后端 WS (含认证)
+        const client = getWeWorkClient({
+          serverUrl: cfg.javaWsUrl,
+          authType: cfg.auth.authType,
+          username: cfg.auth.username,
+          password: cfg.auth.password,
+        });
 
-        // 连接 Java 后端 WS
-        const client = getWeWorkClient({ serverUrl: cfg.javaWsUrl });
+        if (!cfg.auth.username && cfg.auth.authType !== 3) {
+          logger.error("[Auth] auth.username 为空, Java 后端不会推送业务消息! 请在 ~/.openclaw/openclaw.json 的 plugins.entries.wework-scrm.config.auth 里配置");
+        }
 
         client.on("log", (m: string) => logger.info(`[WS] ${m}`));
         client.on("error", (e: Error) => logger.error(`[WS] ${e.message}`));
@@ -106,10 +132,16 @@ export default definePluginEntry({
         });
 
         // 接收 Java 后端推送的事件 (与 PC 前端收到的一样)
+        // 注意: Java 发给客户端的 JSON 字段是小写开头 (msgType/message),
+        //       客户端发给 Java 是大写开头 (MsgType/Content). 两边都兼容一下.
         client.on("json-message", async (json: Record<string, unknown>) => {
           try {
-            const msgType = json.MsgType as string;
-            const content = json.Content as Record<string, unknown> ?? {};
+            const msgType = (json.msgType ?? json.MsgType) as string;
+            let rawContent: any = json.message ?? json.Message ?? json.Content;
+            if (typeof rawContent === "string") {
+              try { rawContent = JSON.parse(rawContent); } catch {}
+            }
+            const content = (rawContent ?? {}) as Record<string, unknown>;
 
             // 消息通知 → 持久化 + 自动回复
             if (msgType === "FriendTalkNotice") {
@@ -130,19 +162,7 @@ export default definePluginEntry({
                 String(d.WxId), String(d.ConvId), d.Content ?? "", d.ContentType ?? 0, logger,
               );
 
-              // 检查是否触发 6-Agent 自动开发流水线
-              const pipeline = getDevPipeline();
-              if (pipeline && pipeline.shouldTrigger(d.Content ?? "")) {
-                logger.info(`[DevPipeline] 触发: from=${d.SenderName}, content="${(d.Content ?? "").slice(0, 60)}..."`);
-                // 异步执行,不阻塞消息处理
-                pipeline.execute({
-                  wxId: String(d.WxId ?? ""),
-                  convId: String(d.ConvId ?? ""),
-                  senderId: String(d.SenderId ?? ""),
-                  senderName: d.SenderName ?? "",
-                  requirement: d.Content ?? "",
-                }).catch((err) => logger.error(`[DevPipeline] 执行失败: ${err.message}`));
-              } else if (!handled && cfg.dify.enabled) {
+              if (!handled && cfg.dify.enabled) {
                 await handleAiReply(
                   String(d.WxId), String(d.ConvId), String(d.SenderId), d.SenderName ?? "", d.Content ?? "",
                   { apiUrl: cfg.dify.apiUrl!, apiKey: cfg.dify.apiKey! }, logger,
@@ -192,16 +212,43 @@ export default definePluginEntry({
       async function ensureConnected(): Promise<boolean> {
         let client = getWeWorkClient();
         if (!client) {
-          // CLI 模式下 service.start() 不会被调用，需要手动初始化
-          client = getWeWorkClient({ serverUrl: cfg.javaWsUrl });
+          // CLI 模式: 用 cliUsername/cliPassword 走独立账号,
+          // 避免跟 service 的 username 互踢. 留空则 fallback 到 auth.username.
+          const cliUser = cfg.auth.cliUsername || cfg.auth.username;
+          const cliPwd  = cfg.auth.cliPassword || cfg.auth.password;
+          if (!cliUser) {
+            console.log("❌ auth.cliUsername (或 auth.username) 未配置, CLI 无法登录 Java 后端");
+            return false;
+          }
+          client = getWeWorkClient({
+            serverUrl: cfg.javaWsUrl,
+            authType: cfg.auth.authType,
+            username: cliUser,
+            password: cliPwd,
+          });
           cliInitiatedConnection = true;
+          // 等到收到 DeviceAuthRsp + accessToken 后才算"真连接成功"
+          // (而不是 ws onopen, 那时心跳还没启动, 几秒就被踢)
           try {
             await new Promise<void>((resolve, reject) => {
-              const timeout = setTimeout(() => reject(new Error("连接超时")), 5000);
-              client!.once("connected", () => { clearTimeout(timeout); resolve(); });
-              client!.once("error", (e: Error) => { clearTimeout(timeout); reject(e); });
+              const timeout = setTimeout(
+                () => reject(new Error("连接超时 (30s)")),
+                30000,
+              );
+              client!.on("log", (m: string) => {
+                if (m.includes("认证成功")) {
+                  clearTimeout(timeout);
+                  resolve();
+                }
+              });
+              client!.once("error", (e: Error) => {
+                clearTimeout(timeout);
+                reject(e);
+              });
               client!.start();
             });
+            // 给 Java 端注册 channel 的时间, 避免发送指令时还没准备好
+            await new Promise((r) => setTimeout(r, 500));
           } catch (e: any) {
             console.log(`❌ 无法连接 Java 后端 (${cfg.javaWsUrl}): ${e.message}`);
             return false;
@@ -294,13 +341,31 @@ export default definePluginEntry({
       ww.command("group")
         .description("群聊管理")
         .argument("<wxId>", "企业微信ID")
-        .argument("<action>", "操作: create/add_member/remove_member/set_name/set_notice/quit")
+        .argument("<action>", "操作: create/add_member/remove_member/set_name/set_notice/quit/list_members/set_remark")
         .option("-g, --group <convId>", "群会话ID")
         .option("-m, --members <ids...>", "成员ID列表")
         .option("-c, --content <text>", "群名/公告内容")
-        .action(withConnection(async (wxId: string, action: string, opts: { group?: string; members?: string[]; content?: string }) => {
+        .option("--send-after <msg>", "建群成功后立即发一条欢迎消息 (仅 create)")
+        .option("--wait-timeout <ms>", "等待 TaskResult 超时", "30000")
+        .action(withConnection(async (wxId: string, action: string, opts: { group?: string; members?: string[]; content?: string; sendAfter?: string; waitTimeout: string }) => {
           const r = chatRoomAction(wxId, action, opts.group, opts.members, opts.content);
-          console.log(r.success ? `✅ 群操作 ${action} 已发送` : `❌ ${r.error}`);
+          if (!r.success) {
+            console.log(`❌ ${r.error}`);
+            return;
+          }
+          console.log(`✅ 群操作 ${action} 已发送 (TaskId=${r.taskId})`);
+          // 建群+欢迎消息流程: 双监听 TaskResultNotice 或 ConversationAddNotice (按群名匹配)
+          if (action === "create" && opts.sendAfter && r.taskId) {
+            console.log(`⏳ 等待建群完成 (TaskId=${r.taskId} 或 群名="${opts.content}")...`);
+            const result = await waitTaskResult(r.taskId, parseInt(opts.waitTimeout), opts.content);
+            if (!result.success || !result.convId) {
+              console.log(`❌ 建群结果未确认: ${result.errMsg ?? "无 ConvId"}`);
+              return;
+            }
+            console.log(`🎉 新群 ConvId=${result.convId}, 发欢迎消息...`);
+            const sr = sendMessage(wxId, result.convId, opts.sendAfter);
+            console.log(sr.success ? `✅ 欢迎消息已发到新群 ${result.convId}` : `❌ 发欢迎消息失败: ${sr.error}`);
+          }
         }));
 
       // --- 发朋友圈 ---
@@ -343,46 +408,71 @@ export default definePluginEntry({
           console.log(r.success ? "✅ 手机状态查询已发送" : `❌ ${r.error}`);
         }));
 
-      // --- 6-Agent 开发流水线 (手动触发) ---
-      ww.command("dev")
-        .description("手动触发 6-Agent 自动开发流水线 (用于测试)")
-        .argument("<wxId>", "发起方企业微信ID")
-        .argument("<convId>", "目标客户会话ID (用于回传结果)")
-        .argument("<requirement>", "需求描述")
-        .option("--sender <id>", "客户ID", "test-sender")
-        .option("--name <name>", "客户姓名", "测试用户")
-        .action(async (wxId: string, convId: string, requirement: string, opts: { sender: string; name: string }) => {
-          // 初始化流水线 (如果还没启用,使用默认配置临时启动)
-          let pipeline = getDevPipeline();
-          if (!pipeline) {
-            pipeline = initDevPipeline({
-              enabled: true,
-              gatewayUrl: cfg.devPipeline.gatewayUrl,
-              gatewayToken: cfg.devPipeline.gatewayToken || undefined,
-              projectsDir: cfg.devPipeline.projectsDir,
-              triggerKeywords: cfg.devPipeline.triggerKeywords,
-              claudeCliPath: cfg.devPipeline.claudeCliPath || undefined,
-            });
-            console.log(`[DevPipeline] 临时启动 (项目目录: ${cfg.devPipeline.projectsDir})`);
-          }
+      // --- 撤回消息 ---
+      ww.command("revoke")
+        .description("撤回已发出的消息")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<msgId>", "消息ID (从 history 拉到的 MsgId)")
+        .argument("<convId>", "会话ID")
+        .action(withConnection(async (wxId: string, msgId: string, convId: string) => {
+          const r = revokeMessage(wxId, msgId, convId);
+          console.log(r.success ? `✅ 撤回指令已发送 (msg=${msgId})` : `❌ ${r.error}`);
+        }));
 
-          if (!await ensureConnected()) return;
+      // --- 转发消息 ---
+      ww.command("forward")
+        .description("转发消息到另一个会话")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<msgId>", "要转发的消息ID")
+        .argument("<fromConvId>", "源会话ID")
+        .argument("<toConvId>", "目标会话ID")
+        .action(withConnection(async (wxId: string, msgId: string, fromConvId: string, toConvId: string) => {
+          const r = forwardMessage(wxId, msgId, fromConvId, toConvId);
+          console.log(r.success ? `✅ 转发指令已发送 (${fromConvId} → ${toConvId})` : `❌ ${r.error}`);
+        }));
+
+      // --- 上传本地文件 → 拽 URL ---
+      // 之后用: wework send <wxId> <convId> <URL> --type image
+      ww.command("upload")
+        .description("上传本地文件到服务器图床, 输出 URL")
+        .argument("<localPath>", "本地文件绝对路径")
+        .option("--upload-url <url>", "fileUpload 接口 URL", "http://127.0.0.1:15086/fileUpload")
+        .action(async (localPath: string, opts: { uploadUrl: string }) => {
+          // 注意: 此命令不需要连 Java WS, 只是 HTTP POST
+          if (!fs.existsSync(localPath)) {
+            console.log(`❌ 文件不存在: ${localPath}`);
+            return;
+          }
+          const fileBuf = fs.readFileSync(localPath);
+          const fileName = path.basename(localPath);
+          const boundary = `----wework${Date.now()}`;
+          const head = Buffer.from(
+            `--${boundary}\r\nContent-Disposition: form-data; name="myfile"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+            "utf8",
+          );
+          const tail = Buffer.from(`\r\n--${boundary}--\r\n`, "utf8");
+          const body = Buffer.concat([head, fileBuf, tail]);
           try {
-            console.log(`🚀 启动开发流水线: "${requirement.slice(0, 60)}..."`);
-            await pipeline.execute({
-              wxId, convId,
-              senderId: opts.sender,
-              senderName: opts.name,
-              requirement,
+            const res = await fetch(opts.uploadUrl, {
+              method: "POST",
+              headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+              body,
             });
-            console.log("✅ 流水线执行完成");
-          } finally {
-            await cleanupConnection();
+            const text = await res.text();
+            const json = JSON.parse(text);
+            const url = json?.data?.url;
+            if (url) {
+              console.log(`✅ ${url}`);
+            } else {
+              console.log(`❌ 上传失败: ${text.slice(0, 200)}`);
+            }
+          } catch (e: any) {
+            console.log(`❌ 上传出错: ${e.message}`);
           }
         });
 
     }, { commands: ["wework"] });
 
-    logger.info("[wework-scrm] 注册完成: 36 Agent工具 + CLI(含dev流水线) + WS客户端模式 (→ Java后端)");
+    logger.info("[wework-scrm] 注册完成: 36 Agent工具 + CLI + WS客户端模式 (→ Java后端)");
   },
 });

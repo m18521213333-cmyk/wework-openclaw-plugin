@@ -12,6 +12,34 @@
         "default": "ws://127.0.0.1:15088",
         "description": "Java 后端 WebSocket 地址 (PC端协议端口)"
       },
+      "auth": {
+        "type": "object",
+        "description": "认证 — 必须配, 否则 Java 后端不会向插件推送业务消息 (msgSend2pc 只对认证连接广播)",
+        "properties": {
+          "authType": {
+            "type": "integer",
+            "enum": [2, 3],
+            "default": 2,
+            "description": "2=Username (账号密码), 3=InternalCode (走IP白名单)"
+          },
+          "username": {
+            "type": "string",
+            "description": "PC端账号 (service 用, 跟 CLI 必须用不同账号否则互踢)"
+          },
+          "password": {
+            "type": "string",
+            "description": "PC端密码"
+          },
+          "cliUsername": {
+            "type": "string",
+            "description": "CLI 命令专用账号 (跟 service 隔离避免 squeeze)"
+          },
+          "cliPassword": {
+            "type": "string",
+            "description": "CLI 账号密码"
+          }
+        }
+      },
       "storage": {
         "type": "object",
         "description": "本地数据存储配置",
