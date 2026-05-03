@@ -121,7 +121,100 @@ function initTables(db: Database.Database): void {
       updated_at TEXT DEFAULT (datetime('now')),
       UNIQUE(wx_id, conv_id)
     );
+
+    -- 待办任务 (跨进程 IPC: CLI 发起 + service 监听 + service 执行后续)
+    -- 用例: CLI 发 ChatRoomActionTask CreateRoom 后退出, service 监听 ConversationAddNotice
+    --      按群名匹配后用新 ConvId 执行 send_after 动作.
+    CREATE TABLE IF NOT EXISTS pending_tasks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id TEXT NOT NULL UNIQUE,
+      task_type TEXT NOT NULL,        -- 'create_room' | ...
+      wx_id TEXT NOT NULL,
+      match_key TEXT,                 -- 用来从 push 通知匹配 (group_name 等)
+      action TEXT NOT NULL,           -- 'send_message' | ...
+      action_payload TEXT NOT NULL,   -- JSON: {convId?, content, contentType?, ...}
+      status TEXT DEFAULT 'pending',  -- pending | done | error | timeout
+      result_conv_id TEXT,            -- 执行后填的新群 ConvId
+      result_msg TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      done_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_tasks(status, task_type);
+    CREATE INDEX IF NOT EXISTS idx_pending_match ON pending_tasks(match_key, status);
   `);
+}
+
+// ============================================
+// 待办任务 (跨进程 IPC)
+// ============================================
+
+export interface PendingTask {
+  id: number;
+  taskId: string;
+  taskType: string;
+  wxId: string;
+  matchKey: string | null;
+  action: string;
+  actionPayload: string;
+  status: string;
+  resultConvId: string | null;
+  resultMsg: string | null;
+}
+
+export function addPendingTask(p: {
+  taskId: string;
+  taskType: string;
+  wxId: string;
+  matchKey?: string;
+  action: string;
+  actionPayload: Record<string, unknown>;
+}): void {
+  getDb()
+    .prepare(
+      "INSERT INTO pending_tasks (task_id, task_type, wx_id, match_key, action, action_payload) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .run(p.taskId, p.taskType, p.wxId, p.matchKey ?? null, p.action, JSON.stringify(p.actionPayload));
+}
+
+export function listPendingTasks(taskType?: string): PendingTask[] {
+  const db = getDb();
+  const rows = taskType
+    ? db.prepare("SELECT id, task_id AS taskId, task_type AS taskType, wx_id AS wxId, match_key AS matchKey, action, action_payload AS actionPayload, status, result_conv_id AS resultConvId, result_msg AS resultMsg FROM pending_tasks WHERE status='pending' AND task_type=?").all(taskType)
+    : db.prepare("SELECT id, task_id AS taskId, task_type AS taskType, wx_id AS wxId, match_key AS matchKey, action, action_payload AS actionPayload, status, result_conv_id AS resultConvId, result_msg AS resultMsg FROM pending_tasks WHERE status='pending'").all();
+  return rows as PendingTask[];
+}
+
+export function findPendingTaskByMatch(taskType: string, matchKey: string): PendingTask | null {
+  const row = getDb()
+    .prepare(
+      "SELECT id, task_id AS taskId, task_type AS taskType, wx_id AS wxId, match_key AS matchKey, action, action_payload AS actionPayload, status, result_conv_id AS resultConvId, result_msg AS resultMsg FROM pending_tasks WHERE status='pending' AND task_type=? AND match_key=? ORDER BY id DESC LIMIT 1",
+    )
+    .get(taskType, matchKey);
+  return (row ?? null) as PendingTask | null;
+}
+
+export function markPendingTaskDone(id: number, resultConvId?: string, resultMsg?: string): void {
+  getDb()
+    .prepare(
+      "UPDATE pending_tasks SET status='done', result_conv_id=?, result_msg=?, done_at=datetime('now') WHERE id=?",
+    )
+    .run(resultConvId ?? null, resultMsg ?? null, id);
+}
+
+export function markPendingTaskError(id: number, errMsg: string): void {
+  getDb()
+    .prepare("UPDATE pending_tasks SET status='error', result_msg=?, done_at=datetime('now') WHERE id=?")
+    .run(errMsg, id);
+}
+
+/** 删除超过 ageHours 还在 pending 的任务 (避免堆积) */
+export function cleanupStalePendingTasks(ageHours: number = 24): number {
+  const r = getDb()
+    .prepare(
+      `UPDATE pending_tasks SET status='timeout', done_at=datetime('now') WHERE status='pending' AND created_at < datetime('now', '-${ageHours} hours')`,
+    )
+    .run();
+  return r.changes;
 }
 
 // ============================================

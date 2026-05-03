@@ -26,7 +26,11 @@ import { registerDeviceTools } from "./tools/device-tools.js";
 import { getWeWorkClient } from "./services/websocket-service.js";
 
 // 自动化 + AI + 存储 + 调度
-import { getDb, closeDb } from "./services/storage-service.js";
+import {
+  getDb, closeDb,
+  addPendingTask, findPendingTaskByMatch, markPendingTaskDone,
+  cleanupStalePendingTasks,
+} from "./services/storage-service.js";
 import { handleAiReply } from "./services/dify-service.js";
 import { checkKeywordReply, checkAutoAcceptFriend, persistMessage } from "./services/automation-engine.js";
 import { startScheduler, stopScheduler } from "./services/scheduler-service.js";
@@ -179,10 +183,52 @@ export default definePluginEntry({
               }
             }
 
+            // 新会话通知 (建群完成等异步操作的回调)
+            // 用于跨进程 IPC: CLI 写入 pending_tasks 后退出, service 这边收到推送匹配执行
+            if (msgType === "ConversationAddNotice") {
+              const conv = (content.Convers ?? (content as any).convers) as any;
+              const groupName = conv?.Name ?? conv?.name;
+              const newConvId = conv?.Id ?? conv?.id;
+              if (groupName && newConvId) {
+                logger.info(`[ConvAdd] 新会话: name="${groupName}" convId=${newConvId}`);
+                try {
+                  const pending = findPendingTaskByMatch("create_room", String(groupName));
+                  if (pending) {
+                    logger.info(`[PendingTask] 命中 task_id=${pending.taskId} action=${pending.action}`);
+                    const payload = JSON.parse(pending.actionPayload);
+                    if (pending.action === "send_message") {
+                      const r = sendMessage(
+                        pending.wxId,
+                        String(newConvId),
+                        payload.content,
+                        payload.contentType ?? "text",
+                      );
+                      if (r.success) {
+                        markPendingTaskDone(pending.id, String(newConvId), "sent");
+                        logger.info(`[PendingTask] ✅ 欢迎消息已发到新群 ${newConvId}`);
+                      } else {
+                        logger.error(`[PendingTask] ❌ 发欢迎消息失败: ${r.error}`);
+                      }
+                    }
+                  }
+                } catch (e: any) {
+                  logger.error(`[PendingTask] 处理异常: ${e.message}`);
+                }
+              }
+            }
+
           } catch (e: any) {
             logger.error(`[Event] ${e.message}`);
           }
         });
+
+        // 每小时清理一次超过 24 小时还在 pending 的任务
+        setInterval(() => {
+          try {
+            const n = cleanupStalePendingTasks(24);
+            if (n > 0) logger.info(`[PendingTask] 清理 ${n} 个 stale 任务`);
+          } catch {}
+        }, 3600 * 1000);
 
         // 启动定时任务调度
         startScheduler(logger);
@@ -354,17 +400,23 @@ export default definePluginEntry({
             return;
           }
           console.log(`✅ 群操作 ${action} 已发送 (TaskId=${r.taskId})`);
-          // 建群+欢迎消息流程: 双监听 TaskResultNotice 或 ConversationAddNotice (按群名匹配)
-          if (action === "create" && opts.sendAfter && r.taskId) {
-            console.log(`⏳ 等待建群完成 (TaskId=${r.taskId} 或 群名="${opts.content}")...`);
-            const result = await waitTaskResult(r.taskId, parseInt(opts.waitTimeout), opts.content);
-            if (!result.success || !result.convId) {
-              console.log(`❌ 建群结果未确认: ${result.errMsg ?? "无 ConvId"}`);
-              return;
+          // 建群+欢迎消息流程: 通过 SQLite IPC 委托给 service 进程执行
+          // (CLI 是短期进程, ConversationAddNotice 推给 service 不是 CLI, 所以 CLI 等不到)
+          if (action === "create" && opts.sendAfter && r.taskId && opts.content) {
+            try {
+              addPendingTask({
+                taskId: String(r.taskId),
+                taskType: "create_room",
+                wxId: wxId,
+                matchKey: opts.content,  // 按群名匹配 ConversationAddNotice
+                action: "send_message",
+                actionPayload: { content: opts.sendAfter, contentType: "text" },
+              });
+              console.log(`📋 已登记 pending 任务: 等 service 收到群"${opts.content}"创建通知后自动发欢迎消息`);
+              console.log(`   (查状态: sqlite3 /root/wework-scrm.db "SELECT * FROM pending_tasks WHERE task_id='${r.taskId}'")`);
+            } catch (e: any) {
+              console.log(`⚠ 登记 pending 任务失败: ${e.message}`);
             }
-            console.log(`🎉 新群 ConvId=${result.convId}, 发欢迎消息...`);
-            const sr = sendMessage(wxId, result.convId, opts.sendAfter);
-            console.log(sr.success ? `✅ 欢迎消息已发到新群 ${result.convId}` : `❌ 发欢迎消息失败: ${sr.error}`);
           }
         }));
 
