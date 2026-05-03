@@ -344,6 +344,7 @@ journalctl -u openclaw-scrm.service -n 30
 3. **图片消息**: Content 字段是图片 URL (base64 编码), 手机 SDK 通过 URL 下载后用企微 SDK 发出。需要 nginx /attachment 反代生效。
 4. **消息撤回**: 只能撤回最近 2 分钟内自己发的消息 (企微限制)。
 5. **群操作**: 建群成员是客户的 RemoteId (不是 ConvId), 注意区分。
+6. **ConvAddNotice 字段坑**: `Convers.Id` 是 Java 数据库主键 (内部 id, 形如 `7635xxxxxxxxxxxxxxx`), `Convers.RemoteId` 才是企微真正的群 ConvId (形如 `10xxxxxxxxxxxxxxx`)。`talkToFriendTask` 必须用 RemoteId, 用 Id 会发到不存在的会话, 出现"诡异单聊红色感叹号"现象。proto 注释里写 "公司id，部门id或其他" 是误导, 实际就是群 ConvId。
 
 ## 项目结构
 

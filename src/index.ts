@@ -188,27 +188,44 @@ export default definePluginEntry({
             if (msgType === "ConversationAddNotice") {
               const conv = (content.Convers ?? (content as any).convers) as any;
               const groupName = conv?.Name ?? conv?.name;
-              const newConvId = conv?.Id ?? conv?.id;
-              if (groupName && newConvId) {
-                logger.info(`[ConvAdd] 新会话: name="${groupName}" convId=${newConvId}`);
+              // 关键: ConvAdd push 的 conv.Id 是 Java DB 主键 (内部 id), 不是企微真正的群 ConvId.
+              // 真正的群 ConvId 在 conv.RemoteId 字段 — talkToFriendTask 必须用 RemoteId,
+              // 用 Id 会发到不存在的会话, 出现 "诡异单聊" 状态. 实测验证:
+              //   群"vip0148群": Id=7635723906955859509(假) RemoteId=10771793581934761(真, MySQL 验证)
+              const internalId = conv?.Id ?? conv?.id;
+              const realConvId = conv?.RemoteId ?? conv?.remoteId;
+              const convType = conv?.Type ?? conv?.type;  // 0=单聊 1=群聊
+              if (groupName && realConvId) {
+                logger.info(`[ConvAdd] 新会话: name="${groupName}" RemoteId=${realConvId} (internalId=${internalId}) type=${convType} (0=单聊 1=群聊)`);
+                // 只匹配群聊 (Type=1), 跳过单聊
+                if (convType !== 1 && convType !== "1") {
+                  logger.info(`[ConvAdd] 跳过 (Type=${convType} 不是群聊)`);
+                  return;
+                }
                 try {
                   const pending = findPendingTaskByMatch("create_room", String(groupName));
                   if (pending) {
                     logger.info(`[PendingTask] 命中 task_id=${pending.taskId} action=${pending.action}`);
                     const payload = JSON.parse(pending.actionPayload);
                     if (pending.action === "send_message") {
-                      const r = sendMessage(
-                        pending.wxId,
-                        String(newConvId),
-                        payload.content,
-                        payload.contentType ?? "text",
-                      );
-                      if (r.success) {
-                        markPendingTaskDone(pending.id, String(newConvId), "sent");
-                        logger.info(`[PendingTask] ✅ 欢迎消息已发到新群 ${newConvId}`);
-                      } else {
-                        logger.error(`[PendingTask] ❌ 发欢迎消息失败: ${r.error}`);
-                      }
+                      // 外部群刚建出来时, 客户可能还在企微确认加群中, 立即发会被拒 (SDK 显示红色感叹号).
+                      // 延迟 ~30 秒等客户确认.
+                      const delayMs = payload.delayMs ?? 30000;
+                      logger.info(`[PendingTask] ⏳ 延迟 ${delayMs}ms 后发欢迎到 RemoteId=${realConvId} (等客户确认加群)`);
+                      setTimeout(() => {
+                        const r = sendMessage(
+                          pending.wxId,
+                          String(realConvId),
+                          payload.content,
+                          payload.contentType ?? "text",
+                        );
+                        if (r.success) {
+                          markPendingTaskDone(pending.id, String(realConvId), "sent");
+                          logger.info(`[PendingTask] ✅ 欢迎消息已发到新群 RemoteId=${realConvId}`);
+                        } else {
+                          logger.error(`[PendingTask] ❌ 发欢迎消息失败: ${r.error}`);
+                        }
+                      }, delayMs);
                     }
                   }
                 } catch (e: any) {
@@ -391,9 +408,10 @@ export default definePluginEntry({
         .option("-g, --group <convId>", "群会话ID")
         .option("-m, --members <ids...>", "成员ID列表")
         .option("-c, --content <text>", "群名/公告内容")
-        .option("--send-after <msg>", "建群成功后立即发一条欢迎消息 (仅 create)")
+        .option("--send-after <msg>", "建群成功后发一条欢迎消息 (仅 create)")
+        .option("--welcome-delay <ms>", "建群后延迟多久发欢迎 (等客户确认加群, 默认 30000ms)", "30000")
         .option("--wait-timeout <ms>", "等待 TaskResult 超时", "30000")
-        .action(withConnection(async (wxId: string, action: string, opts: { group?: string; members?: string[]; content?: string; sendAfter?: string; waitTimeout: string }) => {
+        .action(withConnection(async (wxId: string, action: string, opts: { group?: string; members?: string[]; content?: string; sendAfter?: string; welcomeDelay: string; waitTimeout: string }) => {
           const r = chatRoomAction(wxId, action, opts.group, opts.members, opts.content);
           if (!r.success) {
             console.log(`❌ ${r.error}`);
@@ -404,15 +422,16 @@ export default definePluginEntry({
           // (CLI 是短期进程, ConversationAddNotice 推给 service 不是 CLI, 所以 CLI 等不到)
           if (action === "create" && opts.sendAfter && r.taskId && opts.content) {
             try {
+              const delayMs = parseInt(opts.welcomeDelay) || 30000;
               addPendingTask({
                 taskId: String(r.taskId),
                 taskType: "create_room",
                 wxId: wxId,
-                matchKey: opts.content,  // 按群名匹配 ConversationAddNotice
+                matchKey: opts.content,
                 action: "send_message",
-                actionPayload: { content: opts.sendAfter, contentType: "text" },
+                actionPayload: { content: opts.sendAfter, contentType: "text", delayMs },
               });
-              console.log(`📋 已登记 pending 任务: 等 service 收到群"${opts.content}"创建通知后自动发欢迎消息`);
+              console.log(`📋 已登记 pending 任务: 收到群"${opts.content}"创建通知后, 等 ${delayMs}ms 让客户确认加群, 再自动发欢迎`);
               console.log(`   (查状态: sqlite3 /root/wework-scrm.db "SELECT * FROM pending_tasks WHERE task_id='${r.taskId}'")`);
             } catch (e: any) {
               console.log(`⚠ 登记 pending 任务失败: ${e.message}`);
