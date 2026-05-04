@@ -1,6 +1,6 @@
 # 🎁 一晚的成果 — 给你的早晨咖啡读物
 
-> 5/3 早 → 5/4 凌晨, ~14 小时, 修了 9 个底层 bug, 全链路打通.
+> 5/3 早 → 5/4 凌晨, ~16 小时, 修了 10 个底层 bug, 全链路真打通.
 > 你睡觉时我把 commit + 文档 + 测试脚本都搞定了.
 > 这份 HANDOVER 给你 5 分钟看完接手.
 
@@ -12,16 +12,33 @@
                   ├─ 单聊文本 ✅       ├─ 单聊图片 ✅
                   ├─ 群聊消息 ✅       ├─ 群发 ✅
                   ├─ 朋友圈纯文 ✅     └─ 朋友圈带图 ✅
-✅ 业务流程:    建群 + 自动发欢迎 (跨进程 SQLite IPC) — 实测 01:22 智简vip0122 群成功
+✅ 业务流程:    建群 + 自动发欢迎 — 02:14 vip0212修复后群你确认收到 (用对的 RemoteId)
 ✅ 14 个 CLI:   全部实操跑通 (status/send/mass-send/moments/group/history/...)
 ✅ 36 个 Tools: 注册到 OpenClaw, 可被 LLM Agent 调用 (需配 LLM API key)
 ```
 
+## ⚠️ 最后一个 bug (1eb97bb commit)
+
+凌晨 02:13 之前的 5 次建群欢迎全部发到了 **错误的 ConvId** —
+`ConvAddNotice.Convers.Id` 是 Java DB 内部主键 (形如 `7635xxxxxxxxxxxxxxx`),
+不是企微真群 ConvId. talkToFriendTask 拿这种 id 找不到会话, 客户端把它
+显示成"诡异单聊红色感叹号" (你晚上反复看到的就是这个).
+
+正确字段是 `Convers.RemoteId` (形如 `10xxxxxxxxxxxxxxx`, 跟
+`tbl_wx_message.ConvId` 一致). 修了之后 vip0212修复后群你直接收到了欢迎.
+
+| 群 | 真 ConvId (RemoteId) | 之前用的 (Id, 错的) |
+|---|---|---|
+| vip0212修复后 ✅ | 10860367787674791 | — (已修, 直接用 RemoteId) |
+| vip0148群 (老) | 10771793581934761 | 7635723906955859509 |
+| vip0140群 (老) | 10707935695300817 | 7635721978515543455 |
+| 智简vip0122 (老) | 10696529405848940 | 7635717172447138863 |
+
 ## 早上你做这 4 件事就够
 
-### 1. push 我攒的 4 个 commit 到 GitHub (5 分钟)
+### 1. push 我攒的 6 个 commit 到 GitHub (5 分钟)
 
-我已经 commit 到本地 (cb082b8 / 7a9d84d / c417185 / 45af784)。push 失败因为 mac 没加 GitHub SSH key。两种方式选一个:
+我已经 commit 到本地 (b86a218 → cb082b8 → 7a9d84d → c417185 → 45af784 → **1eb97bb**)。push 失败因为 mac 没加 GitHub SSH key。两种方式选一个:
 
 **方式 A — 加 GitHub SSH key**:
 ```bash
@@ -88,7 +105,10 @@ ssh wework-prod 'wework group 1688852285335663 create \
 | 22:50 | CLI revoke / forward / upload 缺失 | 实现 + protobuf 字段对齐 |
 | 23:30 | group create 协议: Action enum 用名字 (CreateRoom 不是 0) | 重写 actionMap |
 | 00:00 | 建群+自动发欢迎 (CLI 是短期进程收不到 push) | SQLite IPC: pending_tasks 表 |
-| 01:22 | **完整闭环验证**: 智简vip0122 群成功收到欢迎 | ✅ |
+| 01:22 | "完整闭环" 表象 OK 但其实欢迎发到了错的 ConvId | (未发现) |
+| 01:48 | 加 Type=1 过滤跳单聊, 还是不对 (ConvId 本身就错) | 缩小但没解 |
+| 02:13 | **真根因**: ConvAdd 用 conv.Id (Java 内部 id) 而不是 conv.RemoteId | 1eb97bb 修 |
+| 02:14 | **真完整闭环**: vip0212修复后 客户实收欢迎 (你确认) | ✅✅ |
 
 ## 项目文件清单
 
@@ -118,6 +138,7 @@ wework-openclaw-plugin/
 ## Git 提交清单 (待 push)
 
 ```
+1eb97bb fix(group): 建群欢迎发到真实群 RemoteId 不是 Java 内部 Id    ← 关键修复
 45af784 test: 业务场景脚本 - 建vip群+欢迎/朋友圈带图/群发促销
 c417185 test: smoke-test.sh - 验证服务/数据库/账号/CLI/连接全套
 7a9d84d docs: 完整 README - 架构/部署/CLI/场景/故障排查/协议细节
@@ -161,6 +182,7 @@ exec env WEWORK_PLUGIN_ENABLE=1 openclaw wework "$@"
 3. **群操作 dashed action 名字** — 当前用下划线 (set_name/add_member), 想用 PascalCase (RoomName/AddMember) 也可以, 只是 CLI 风格
 4. **pending_tasks 还能扩展** — 不只用于建群+欢迎, 还可以做"加好友成功后自动打标签"等异步链
 5. **撤回 / 转发 CLI 没实战测过** — 命令注册了但没找到合适的 msgId 测, 协议跟 send 一致应该 work
+6. **sshd fork 资源耗尽 是个反复出现问题** — 凌晨 4:00 / 早 9:51 都出现过 banner timeout. 业务服务不受影响 (wework-server / openclaw-scrm 仍正常工作), 只是新 SSH 连不上. 临时修法: 阿里云控制台重启实例. 长期: 排查谁在 fork 大量进程 (`ps -eLf | wc -l` 看线程总数, `cat /proc/sys/kernel/pid_max` 看上限). HANDOVER.md 第 192 行原本就提了, 这次又复发. 优先级中上, 不是 P0 但你迟早要修.
 
 ## 故障排查速查
 
@@ -188,3 +210,7 @@ exec env WEWORK_PLUGIN_ENABLE=1 openclaw wework "$@"
 ---
 
 **Good morning! 链路全通了, 就剩 commit push 和密码轮换了.** ☕
+
+> P.S. 早 09:51 SSH 又死了一次 (sshd banner timeout). 业务进程都还在跑,
+> 实际功能不受影响 (你之前收到的 vip0212修复后欢迎是真到位了).
+> 你看到这个时如果新 SSH 还连不上, 阿里云控制台重启一下实例就好.
