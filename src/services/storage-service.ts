@@ -14,6 +14,7 @@
 
 import Database from "better-sqlite3";
 import * as path from "node:path";
+import * as fs from "node:fs";
 
 let _db: Database.Database | null = null;
 
@@ -240,6 +241,28 @@ export function getRecentMediaFromSender(wxId: string, senderId: string, withinM
       url = obj.url || obj.fileUrl || "";
       thumbUrl = obj.thumbUrl || obj.coverUrl || "";
     }
+
+    // [Java 后端 bug 兜底] Voice 类型 Java 报的 URL 后缀是 .mp3,
+    // 但磁盘实际存的是 .amr. 转发该 URL 给目标方时手机 SDK 下载会 404.
+    // 这里 fallback: 用 fs 检测真实存在的扩展名替换.
+    if ((r.content_type === "Voice" || r.content_type === "3") && url) {
+      try {
+        // URL → 本地路径: /attachment/2026.../xxx.mp3 → /app/storage/attachment/2026.../xxx
+        const m = url.match(/\/attachment\/(\d+)\/([A-F0-9]+)\.([a-z0-9]+)$/i);
+        if (m) {
+          const [, date, hash] = m;
+          const dir = `/app/storage/attachment/${date}`;
+          for (const ext of ["amr", "silk", "mp3", "m4a", "wav"]) {
+            const p = `${dir}/${hash}.${ext}`;
+            if (fs.existsSync(p)) {
+              url = url.replace(/\.[a-z0-9]+$/i, `.${ext}`);
+              break;
+            }
+          }
+        }
+      } catch { /* ignore */ }
+    }
+
     return {
       contentType: r.content_type,
       url,

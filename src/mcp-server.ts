@@ -120,17 +120,32 @@ const TOOLS = [
   },
   {
     name: "wework_send_image_url",
-    description: "把已有 URL 的图片发给会话, 接收方看到的是真实图片 (不是文本链接). 转发场景必用: 从 wework_recent_media 拿到 URL 后直接调这个把图发给目标. 多张图就循环调多次.",
+    description: "把已有 URL 的图片发给会话, 接收方看到真图 (不是文本链接). 转发场景必用: 从 wework_recent_media 拿到 URL 后调这个把图发给目标. 多张图循环调.",
     inputSchema: {
       type: "object",
       properties: {
         wxId: { type: "string" },
         convId: { type: "string", description: "目标会话 (单聊 RemoteId 或群 ConvId)" },
-        url: { type: "string", description: "图片 URL (例从 wework_recent_media 拿到的)" },
+        url: { type: "string", description: "图片 URL (例从 wework_recent_media 拿到)" },
       },
       required: ["wxId", "convId", "url"],
     },
     runArgs: (a: any) => ["send", a.wxId, a.convId, a.url, "--type", "image"],
+  },
+  {
+    name: "wework_send_media_url",
+    description: "把任意类型媒体 URL 发给会话 (语音/视频/文件). 接收方看到真实媒体, 不是文字链接. 用于转发用户在 IM 里发的语音/视频/文件给目标方.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string" },
+        convId: { type: "string", description: "目标会话" },
+        url: { type: "string", description: "媒体 URL (从 wework_recent_media 拿到)" },
+        mediaType: { type: "string", enum: ["image", "voice", "video", "file"], description: "媒体类型, 跟 wework_recent_media 返回的 contentType 对应" },
+      },
+      required: ["wxId", "convId", "url", "mediaType"],
+    },
+    runArgs: (a: any) => ["send", a.wxId, a.convId, a.url, "--type", a.mediaType],
   },
   {
     name: "wework_mass_send",

@@ -110,13 +110,17 @@ export function handleAiCommand(ctx: CmdContext): boolean {
 - wework__wework_recent_media: 拿用户在 IM 里最近发的图/音/视频/文件 URL 列表 (支持多张, senderId=${ctx.senderId})
 - wework__wework_upload: 上传服务器本地文件, 返回 URL
 
-媒体发送工作流 (用户说"把刚发的 N 张图都发给XX, 加文字Y"):
-1. wework__wework_recent_media(wxId, senderId=${ctx.senderId}, limit=N) 拿全部 N 张图的 URL 数组
-2. wework__wework_find_contact 找 XX 的 convId
+媒体发送工作流 (用户说"把刚发的 X 个媒体发给YY, 加文字Y"):
+1. wework__wework_recent_media(wxId, senderId=${ctx.senderId}, limit=N) 拿 URL 列表
+   返回每条带 contentType (Picture/Voice/Video/File) 和 url
+2. wework__wework_find_contact 找 YY 的 convId
 3. 先 wework__wework_send_message(wxId, convId, message=Y) 发文字
-4. 然后对每张图循环 wework__wework_send_image_url(wxId, convId, url=URL_i)
-   重要: 转发图片必须用 wework_send_image_url 不能用 wework_send_message 发 URL,
-   否则接收方看到的是文字链接不是图片!
+4. 对每个媒体调 wework__wework_send_media_url(wxId, convId, url, mediaType)
+   mediaType 映射: Picture→image, Voice→voice, Video→video, File→file
+
+重要: 转发媒体必须用 wework_send_media_url, 不能用 wework_send_message,
+否则接收方看到的是文字 URL 链接不是真实媒体!
+(图片专用快捷方式 wework_send_image_url 也行, 跟 send_media_url + image 等价)
 
 回复格式要求:
 - 用纯文本, 不要 markdown 表格 / 列表 / 代码块 (微信不渲染)
