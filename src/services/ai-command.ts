@@ -112,15 +112,22 @@ export function handleAiCommand(ctx: CmdContext): boolean {
 
 媒体发送工作流 (用户说"把刚发的 X 个媒体发给YY, 加文字Y"):
 1. wework__wework_recent_media(wxId, senderId=${ctx.senderId}, limit=N) 拿 URL 列表
-   返回每条带 contentType (Picture/Voice/Video/File) 和 url
+   每条返回: contentType, url, msgId, forwardable, thumbUrl, reason
 2. wework__wework_find_contact 找 YY 的 convId
 3. 先 wework__wework_send_message(wxId, convId, message=Y) 发文字
-4. 对每个媒体调 wework__wework_send_media_url(wxId, convId, url, mediaType)
-   mediaType 映射: Picture→image, Voice→voice, Video→video, File→file
+4. 对每个媒体:
+   a. forwardable=true (Picture/Voice 一般 OK): wework_send_media_url(wxId, convId, url, mediaType) 真发出去
+      mediaType: Picture→image, Voice→voice
+   b. forwardable=false (Video/File 常态, 工作手机 SDK 限制不能 server-side 转发):
+      → 试 wework_resolve_media(wxId, msgId, waitSec=45) 触发手机下载到图床 (有时手机 SDK 不响应)
+      → 成功就 wework_send_media_url 发
+      → 失败就**老实告诉用户**: "视频/文件因工作手机 SDK 限制无法自动转发, 你手动在企微转发更快".
+        如果有 thumbUrl 可以用 send_image_url 发缩略图作为预览.
 
-重要: 转发媒体必须用 wework_send_media_url, 不能用 wework_send_message,
-否则接收方看到的是文字 URL 链接不是真实媒体!
-(图片专用快捷方式 wework_send_image_url 也行, 跟 send_media_url + image 等价)
+绝对不能做的事:
+- 转发媒体用 wework_send_message(发文字 URL 字符串), 接收方看到链接不是真媒体
+- 谎报"已发送"成功, resolve_media 失败时必须老实告诉用户
+- 视频/文件的 url 字段是 /storage/emulated/... 手机本地路径不是公网, 永远不能直接 send
 
 回复格式要求:
 - 用纯文本, 不要 markdown 表格 / 列表 / 代码块 (微信不渲染)

@@ -46,6 +46,7 @@ import {
   getContactInfo, triggerSync, phoneState,
   chatRoomAction, massSend, postMoments, pullMySns,
   waitTaskResult,
+  downloadByMsgId,
 } from "./services/send-helper.js";
 
 // node 内置: HTTP 上传 (wework upload 用)
@@ -495,6 +496,68 @@ export default definePluginEntry({
             console.log(`  ${tag} ${(c.name || "无名").padEnd(28)} ${c.alias ? "("+c.alias+") " : ""}${(c.corp_name || "")}  convId=${c.remote_id}`);
           }
         });
+
+      // --- 解析视频/文件 URL (Java 没自动转存的, 触发下载到图床后返回真 URL) ---
+      ww.command("resolve-media")
+        .description("视频/文件 Java 没存图床时, 触发下载 + 等到位 + 返回真 URL")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<msgId>", "消息 MsgId (从 history 拿)")
+        .option("-w, --wait <s>", "最大等待秒数", "30")
+        .option("--json", "JSON 输出")
+        .action(withConnection(async (wxId: string, msgId: string, opts: { wait: string; json?: boolean }) => {
+          const waitSec = parseInt(opts.wait, 10) || 30;
+          // 1. 找原 message 拿 url 里的 hash
+          const db = getDb(cfg.storage.sqlitePath);
+          const row = db.prepare("SELECT content FROM messages WHERE wx_id=? AND msg_id=? LIMIT 1").get(wxId, msgId) as any;
+          if (!row) {
+            console.log(opts.json ? JSON.stringify({ ok: false, error: "msg not found" }) : `❌ msgId=${msgId} 不在本地 messages 表`);
+            return;
+          }
+          let originalUrl = "";
+          try {
+            const decoded = Buffer.from(row.content, "base64").toString("utf8");
+            originalUrl = JSON.parse(decoded).url || "";
+          } catch { try { originalUrl = JSON.parse(row.content).url || ""; } catch {} }
+          // 提取 hash (MD5 32 hex chars)
+          const hashMatch = originalUrl.match(/([a-fA-F0-9]{32})\.[a-z0-9]+/);
+          if (!hashMatch) {
+            console.log(opts.json ? JSON.stringify({ ok: false, error: "no hash in url" }) : `❌ url 里没找到 MD5 hash: ${originalUrl}`);
+            return;
+          }
+          const hash = hashMatch[1].toUpperCase();
+          // 2. 触发下载
+          const trig = downloadByMsgId(wxId, msgId);
+          if (!trig.success) {
+            console.log(opts.json ? JSON.stringify({ ok: false, error: trig.error }) : `❌ 触发下载失败: ${trig.error}`);
+            return;
+          }
+          // 3. 等文件出现
+          const dirs = ["20260505", "20260504", "20260503"]; // 简单查最近 3 天
+          const startMs = Date.now();
+          let foundUrl = "";
+          while (Date.now() - startMs < waitSec * 1000) {
+            for (const date of dirs) {
+              const dir = `/app/storage/attachment/${date}`;
+              if (fs.existsSync(dir)) {
+                const entries = fs.readdirSync(dir);
+                const match = entries.find((f) => f.toUpperCase().startsWith(hash + "."));
+                if (match) {
+                  foundUrl = `http://60.205.94.161/attachment/${date}/${match}`;
+                  break;
+                }
+              }
+            }
+            if (foundUrl) break;
+            await new Promise((r) => setTimeout(r, 1500));
+          }
+          if (foundUrl) {
+            console.log(opts.json ? JSON.stringify({ ok: true, url: foundUrl, waitedMs: Date.now() - startMs })
+              : `✅ 已到位 (${Math.round((Date.now() - startMs) / 1000)}s): ${foundUrl}`);
+          } else {
+            console.log(opts.json ? JSON.stringify({ ok: false, error: "timeout", hash, waitedSec: waitSec })
+              : `❌ ${waitSec}s 内文件没出现 (hash=${hash}). 可能 Java 下载失败 or 文件特别大.`);
+          }
+        }));
 
       // --- 拉某联系人最近发的图片/语音/视频/文件 URL (支持多张) ---
       ww.command("recent-media")

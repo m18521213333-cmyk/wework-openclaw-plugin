@@ -214,7 +214,7 @@ export function listPhoneStatusEvents(wxId?: string, limit = 50): any[] {
 export function getRecentMediaFromSender(wxId: string, senderId: string, withinMinutes = 30, limit = 10): any[] {
   const db = getDb();
   const rows = db.prepare(`
-    SELECT content_type, content, datetime(created_at, 'localtime') AS ts
+    SELECT content_type, content, msg_id, datetime(created_at, 'localtime') AS ts
     FROM messages
     WHERE wx_id=? AND sender_id=?
       AND content_type IN ('Picture', 'Voice', 'Video', 'File', '2', '3', '4', '5')
@@ -247,7 +247,6 @@ export function getRecentMediaFromSender(wxId: string, senderId: string, withinM
     // 这里 fallback: 用 fs 检测真实存在的扩展名替换.
     if ((r.content_type === "Voice" || r.content_type === "3") && url) {
       try {
-        // URL → 本地路径: /attachment/2026.../xxx.mp3 → /app/storage/attachment/2026.../xxx
         const m = url.match(/\/attachment\/(\d+)\/([A-F0-9]+)\.([a-z0-9]+)$/i);
         if (m) {
           const [, date, hash] = m;
@@ -263,11 +262,20 @@ export function getRecentMediaFromSender(wxId: string, senderId: string, withinM
       } catch { /* ignore */ }
     }
 
+    // [视频/文件转发限制] Java 后端不会把客户发的视频/文件存到图床, 直接报手机本地路径
+    // 形如 /storage/emulated/0/Download/... 这种公网下载不了.
+    // 我们标记 forwardable=false, LLM 看到就别瞎报"成功".
+    const forwardable = !!url && /^https?:\/\//.test(url);
+
     return {
       contentType: r.content_type,
-      url,
+      url: forwardable ? url : "",
       thumbUrl,
       ts: r.ts,
+      msgId: r.msg_id,
+      forwardable,
+      reason: forwardable ? undefined : "Java 没存图床, URL 是手机本地路径. 用 wework_resolve_media(msgId) 触发下载到图床, 等到位后再转发.",
+      thumbUrlForwardable: !!thumbUrl && /^https?:\/\//.test(thumbUrl),
     };
   });
 }

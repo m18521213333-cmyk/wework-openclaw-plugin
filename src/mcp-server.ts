@@ -368,6 +368,20 @@ const TOOLS = [
     runArgs: (a: any) => ["upload", a.localPath],
   },
   {
+    name: "wework_resolve_media",
+    description: "对 forwardable=false 的视频/文件, 触发 Java 从手机下载到图床, 等到位后返回真实公网 URL. 用于视频/文件转发: 先调这个拿真 URL, 再用 wework_send_media_url 转发. 默认等 30 秒, 大文件可加大.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string" },
+        msgId: { type: "string", description: "原 message 的 MsgId, 从 wework_get_history 拿" },
+        waitSec: { type: "number", description: "最大等待秒数, 默认 30" },
+      },
+      required: ["wxId", "msgId"],
+    },
+    runArgs: (a: any) => ["resolve-media", a.wxId, a.msgId, "-w", String(a.waitSec ?? 30), "--json"],
+  },
+  {
     name: "wework_recent_media",
     description: "拿用户在 IM 里最近发的图/音/视频/文件列表 (支持多张). 用户说 '把刚发的 N 张图都发给XX' 时, 先调这个拿全部 URL, 再循环调 wework_send_message 给目标方逐张发 (contentType=image/voice/video).",
     inputSchema: {
