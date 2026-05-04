@@ -154,6 +154,28 @@ function initTables(db: Database.Database): void {
       ts TEXT DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_phone_events_wxid_ts ON phone_status_events(wx_id, ts);
+
+    -- 联系人本地缓存 (从 Java ContactPushNotice / CustomerPushNotice 落库)
+    -- 让 LLM 用 wework_find_contact 能找到任何同步过的联系人, 不再要求"必须聊过"
+    CREATE TABLE IF NOT EXISTS contacts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      wx_id TEXT NOT NULL,            -- 我的企微 wxid
+      remote_id TEXT NOT NULL,        -- 联系人 RemoteId (= 单聊 convId)
+      name TEXT,                      -- 显示名 (含公司)
+      alias TEXT,                     -- 别名/备注
+      avatar TEXT,
+      corp_id TEXT,                   -- 外部联系人公司 id
+      corp_name TEXT,
+      contact_type INTEGER,           -- 1=内部同事 2=外部客户
+      gender INTEGER,
+      phone TEXT,
+      job TEXT,
+      raw_json TEXT,                  -- 完整 push 内容备份
+      last_synced_at TEXT DEFAULT (datetime('now')),
+      UNIQUE(wx_id, remote_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_contacts_wxid_name ON contacts(wx_id, name);
+    CREATE INDEX IF NOT EXISTS idx_contacts_wxid_alias ON contacts(wx_id, alias);
   `);
 }
 
@@ -180,6 +202,106 @@ export function listPhoneStatusEvents(wxId?: string, limit = 50): any[] {
   return wxId
     ? db.prepare("SELECT * FROM phone_status_events WHERE wx_id=? ORDER BY id DESC LIMIT ?").all(wxId, limit)
     : db.prepare("SELECT * FROM phone_status_events ORDER BY id DESC LIMIT ?").all(limit);
+}
+
+// 按名字模糊找联系人 — 双源合并: 先查 contacts 表 (包含全部同步过的),
+// 再 fallback 到 messages 表 (聊过的). LLM 用 "给赵丽发消息" 这种自然语言时优先调这个.
+export function findContactsByName(wxId: string, namePattern: string, limit = 10): any[] {
+  const db = getDb();
+  const like = `%${namePattern}%`;
+
+  // 1) 主源: contacts 表 (含未聊过的同步联系人)
+  const fromContacts = db.prepare(`
+    SELECT
+      remote_id    AS conv_id,
+      name         AS sender_name,
+      alias,
+      corp_name,
+      contact_type,
+      last_synced_at AS last_seen,
+      'contact'    AS source,
+      0            AS msg_count
+    FROM contacts
+    WHERE wx_id=? AND (name LIKE ? OR alias LIKE ?)
+    ORDER BY last_synced_at DESC
+    LIMIT ?
+  `).all(wxId, like, like, limit) as any[];
+
+  // 2) 备用源: messages 表 (聊过的联系人, 即使没在 contacts 里)
+  const haveRemoteIds = new Set(fromContacts.map((c: any) => c.conv_id));
+  const fromMessages = db.prepare(`
+    SELECT
+      conv_id,
+      sender_name,
+      NULL         AS alias,
+      NULL         AS corp_name,
+      NULL         AS contact_type,
+      MAX(created_at) AS last_seen,
+      'message'    AS source,
+      COUNT(*)     AS msg_count
+    FROM messages
+    WHERE wx_id=? AND sender_name LIKE ?
+    GROUP BY conv_id, sender_name
+    ORDER BY MAX(created_at) DESC
+    LIMIT ?
+  `).all(wxId, like, limit) as any[];
+
+  // 合并 (contacts 优先), 同 conv_id 不重复
+  const merged = [...fromContacts];
+  for (const m of fromMessages) {
+    if (!haveRemoteIds.has(m.conv_id)) merged.push(m);
+  }
+  return merged.slice(0, limit);
+}
+
+// 联系人表 upsert (从 Java push notice 调用)
+export interface ContactRecord {
+  wxId: string;
+  remoteId: string;
+  name?: string;
+  alias?: string;
+  avatar?: string;
+  corpId?: string;
+  corpName?: string;
+  contactType?: number;
+  gender?: number;
+  phone?: string;
+  job?: string;
+  rawJson?: string;
+}
+export function upsertContact(c: ContactRecord): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO contacts (wx_id, remote_id, name, alias, avatar, corp_id, corp_name, contact_type, gender, phone, job, raw_json, last_synced_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(wx_id, remote_id) DO UPDATE SET
+      name=excluded.name,
+      alias=excluded.alias,
+      avatar=excluded.avatar,
+      corp_id=excluded.corp_id,
+      corp_name=excluded.corp_name,
+      contact_type=excluded.contact_type,
+      gender=excluded.gender,
+      phone=excluded.phone,
+      job=excluded.job,
+      raw_json=excluded.raw_json,
+      last_synced_at=datetime('now')
+  `).run(c.wxId, c.remoteId, c.name ?? null, c.alias ?? null, c.avatar ?? null,
+    c.corpId ?? null, c.corpName ?? null, c.contactType ?? null,
+    c.gender ?? null, c.phone ?? null, c.job ?? null, c.rawJson ?? null);
+}
+
+export function listContacts(wxId: string, limit = 100): any[] {
+  const db = getDb();
+  return db.prepare(
+    "SELECT * FROM contacts WHERE wx_id=? ORDER BY last_synced_at DESC LIMIT ?",
+  ).all(wxId, limit);
+}
+
+export function countContacts(wxId: string): number {
+  const db = getDb();
+  const r = db.prepare("SELECT COUNT(*) AS n FROM contacts WHERE wx_id=?").get(wxId) as any;
+  return r?.n ?? 0;
 }
 
 // ============================================

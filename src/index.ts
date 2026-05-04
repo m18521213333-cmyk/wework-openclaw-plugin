@@ -35,7 +35,8 @@ import { handleAiReply } from "./services/dify-service.js";
 import { checkKeywordReply, checkAutoAcceptFriend, persistMessage } from "./services/automation-engine.js";
 import { startScheduler, stopScheduler } from "./services/scheduler-service.js";
 import { startPhoneMonitor, stopPhoneMonitor } from "./services/phone-monitor.js";
-import { listPhoneStatusEvents } from "./services/storage-service.js";
+import { startContactSync, stopContactSync, handleContactPush, getLastSyncTime } from "./services/contact-sync.js";
+import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts } from "./services/storage-service.js";
 
 // send-helper (CLI 直接调用)
 import {
@@ -190,6 +191,34 @@ export default definePluginEntry({
               if (remoteId && remoteId !== "0") {
                 checkAutoAcceptFriend(wxId, remoteId, logger);
               }
+              // 同时落库 contacts 表 (单个客户进来, content 直接是客户字段)
+              if (remoteId) {
+                handleContactPush({
+                  WxId: wxId,
+                  Contacts: [{
+                    RemoteId: remoteId,
+                    Name: content.Name,
+                    Alias: content.Alias,
+                    Avatar: content.Avatar,
+                    CorpId: content.CorpId,
+                    CorpName: content.CorpName,
+                    Type: content.Type ?? 2,  // 默认外部
+                    Gender: content.Gender,
+                    Phone: content.Phone,
+                    Position: content.Position ?? content.Job,
+                  }],
+                }, logger);
+              }
+            }
+
+            // 联系人 / 客户列表批量推送 → 落库 contacts 表
+            // (sync contacts 触发后 Java 推这些消息, 一次可能几百个联系人)
+            if (
+              msgType === "ContactPushNotice" ||
+              msgType === "CustomerPushNotice" ||
+              msgType === "ConversationPushNotice"  // 群成员也包含 RemoteId
+            ) {
+              handleContactPush(content, logger);
             }
 
             // 新会话通知 (建群完成等异步操作的回调)
@@ -262,6 +291,15 @@ export default definePluginEntry({
         // 启动手机 SDK 在线状态监控 (60s 轮询 MySQL, 状态变化时落库 + 告警)
         startPhoneMonitor(logger, 60_000);
 
+        // 启动联系人定时同步 (启动 30s 后跑第一次, 之后每 30min 一次)
+        // 同步指令发到 Java, 联系人列表回来走 ContactPushNotice → handleContactPush 落 SQLite contacts 表
+        if (cfg.auth?.username) {
+          // 用第一个配置的 wxId. 多账号场景需要扩展 (按 wxAccountInfo 表所有 isonline=0 的)
+          // 这里先用约定的: 如果配置里没有显式 wxId, 用 1688852285335663 (孟伟)
+          const syncWxId = (cfg as any).syncWxId || "1688852285335663";
+          startContactSync(syncWxId, logger, 30 * 60 * 1000, 30_000);
+        }
+
         // 连接
         await client.start();
       },
@@ -269,6 +307,7 @@ export default definePluginEntry({
       async stop() {
         stopScheduler();
         stopPhoneMonitor();
+        stopContactSync();
         const c = getWeWorkClient();
         if (c) await c.stop();
         closeDb();
@@ -415,6 +454,50 @@ export default definePluginEntry({
             for (const w of result.warnings) console.log(`  - ${w}`);
           }
         }));
+
+      // --- 列出本地缓存的联系人 ---
+      ww.command("contacts")
+        .description("列本地缓存的联系人 (来自定时同步 + push 推送)")
+        .argument("<wxId>", "企业微信ID")
+        .option("-n, --limit <n>", "条数, 默认 50", "50")
+        .option("--json", "JSON 输出")
+        .action((wxId: string, opts: { limit: string; json?: boolean }) => {
+          const limit = parseInt(opts.limit, 10) || 50;
+          const list = listContacts(wxId, limit);
+          const total = countContacts(wxId);
+          const sync = getLastSyncTime();
+          if (opts.json) { console.log(JSON.stringify({ total, lastSync: sync, items: list }, null, 2)); return; }
+          console.log(`共 ${total} 个联系人. 最近同步: ${sync.ageSec >= 0 ? `${sync.ageSec}s 前` : "未同步过"}`);
+          if (list.length === 0) {
+            console.log("(尚无数据. 启动后 30s 才会触发首次同步, 或者你 wework sync ${wxId} contacts 主动触发)");
+            return;
+          }
+          for (const c of list as any[]) {
+            const tag = c.contact_type === 1 ? "[内部]" : c.contact_type === 2 ? "[外部]" : "[?]";
+            console.log(`  ${tag} ${(c.name || "无名").padEnd(28)} ${c.alias ? "("+c.alias+") " : ""}${(c.corp_name || "")}  convId=${c.remote_id}`);
+          }
+        });
+
+      // --- 按名字找联系人 (优先 contacts 表, 然后 messages 历史) ---
+      // 让 LLM 能处理"给赵丽发消息"这种自然语言, 先 find-contact 拿 convId, 再 send
+      ww.command("find-contact")
+        .description("按名字 (模糊匹配) 找联系人 convId (优先 contacts 同步表, 备用聊天历史)")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<namePattern>", "联系人名字关键字 (会模糊匹配)")
+        .option("--json", "JSON 输出")
+        .action((wxId: string, namePattern: string, opts: { json?: boolean }) => {
+          const matches = findContactsByName(wxId, namePattern, 10);
+          if (opts.json) { console.log(JSON.stringify(matches, null, 2)); return; }
+          if (matches.length === 0) {
+            console.log(`❌ 没找到名字含 "${namePattern}" 的联系人`);
+            console.log(`提示: 必须曾经跟你聊过 (在 SQLite messages 表里有记录) 才能查到. 没聊过的需要先 wework sync ${wxId} contacts 同步通讯录.`);
+            return;
+          }
+          console.log(`找到 ${matches.length} 个匹配 "${namePattern}" 的会话:`);
+          for (const m of matches as any[]) {
+            console.log(`  ${m.sender_name.padEnd(30)}  convId=${m.conv_id}  最后活跃=${m.last_seen}  消息数=${m.msg_count}`);
+          }
+        });
 
       // --- 手机状态事件历史 ---
       ww.command("events")
@@ -572,15 +655,52 @@ export default definePluginEntry({
         }));
 
       // --- 历史消息 ---
+      // 历史消息: 直接读 SQLite (Java push 已经同步过来), 同步返回真实内容
+      // LLM/agent 调这个能立刻拿到内容, 不走异步 Java 触发
       ww.command("history")
-        .description("拉取历史消息")
+        .description("查会话历史消息 (直接读 SQLite 本地, 同步返回真实内容)")
         .argument("<wxId>", "企业微信ID")
         .argument("<convId>", "会话ID")
-        .option("-n, --count <n>", "条数", "50")
-        .action(withConnection(async (wxId: string, convId: string, opts: { count: string }) => {
-          const r = triggerHistoryMessages(wxId, convId, parseInt(opts.count));
-          console.log(r.success ? `✅ 拉取 ${opts.count} 条历史消息` : `❌ ${r.error}`);
-        }));
+        .option("-n, --count <n>", "条数", "20")
+        .option("--json", "JSON 输出")
+        .option("--sync-from-java", "同时触发 Java 重新拉一遍 (异步, 这次未必有新内容, 下次再调有更全)")
+        .action(async (wxId: string, convId: string, opts: { count: string; json?: boolean; syncFromJava?: boolean }) => {
+          const limit = parseInt(opts.count, 10) || 20;
+          const db = getDb(cfg.storage.sqlitePath);
+          const rows = db.prepare(
+            "SELECT datetime(created_at, 'localtime') AS ts, sender_name, content_type, content, is_send, msg_id " +
+            "FROM messages WHERE wx_id=? AND conv_id=? ORDER BY id DESC LIMIT ?"
+          ).all(wxId, convId, limit) as any[];
+
+          // 解码 base64 文本内容 (我们落库时 Text 类型 content 是 base64)
+          const decoded = rows.map((r) => {
+            let content = r.content;
+            if (r.content_type === "Text" || r.content_type === "text" || r.content_type === "1") {
+              try { content = Buffer.from(r.content, "base64").toString("utf8"); } catch {}
+            }
+            return { ...r, content };
+          });
+
+          if (opts.json) {
+            console.log(JSON.stringify(decoded.reverse(), null, 2));
+          } else {
+            if (decoded.length === 0) {
+              console.log(`暂无历史消息 (wxId=${wxId}, convId=${convId}). 你可以加 --sync-from-java 触发后端拉一遍.`);
+            } else {
+              console.log(`最近 ${decoded.length} 条 (新→旧):`);
+              for (const r of decoded as any[]) {
+                const dir = r.is_send === "true" ? "→" : "←";
+                const text = String(r.content).replace(/\s+/g, " ").slice(0, 80);
+                console.log(`  [${r.ts}] ${dir} ${(r.sender_name || "?").padEnd(20)} (${r.content_type}) ${text}`);
+              }
+            }
+          }
+
+          if (opts.syncFromJava) {
+            // 触发 Java 异步拉, 下次调本命令会拿到更全
+            triggerHistoryMessages(wxId, convId, limit);
+          }
+        });
 
       // --- 联系人信息 ---
       ww.command("contact")

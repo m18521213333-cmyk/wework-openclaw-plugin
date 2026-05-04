@@ -173,17 +173,17 @@ const TOOLS = [
   },
   {
     name: "wework_get_history",
-    description: "拉取某个会话的历史消息记录.",
+    description: "查会话历史消息 (直接同步返回真实内容, 不是异步触发). 用这个看用户最近聊了什么再决定回复. 返回 JSON 数组, 每条含 ts/sender_name/content/is_send.",
     inputSchema: {
       type: "object",
       properties: {
         wxId: { type: "string" },
-        convId: { type: "string" },
+        convId: { type: "string", description: "会话 ID (单聊客户 RemoteId 或群 ConvId)" },
         n: { type: "number", description: "条数, 默认 10", default: 10 },
       },
       required: ["wxId", "convId"],
     },
-    runArgs: (a: any) => ["history", a.wxId, a.convId, "-n", String(a.n ?? 10)],
+    runArgs: (a: any) => ["history", a.wxId, a.convId, "-n", String(a.n ?? 10), "--json"],
   },
   {
     name: "wework_search_messages",
@@ -312,6 +312,19 @@ const TOOLS = [
     description: "综合健康检查 (服务/端口/Java/手机/swap/SQLite). 排查问题首选.",
     inputSchema: { type: "object", properties: {} },
     runArgs: (_a: any) => ["health", "--json"],
+  },
+  {
+    name: "wework_find_contact",
+    description: "按名字模糊找联系人 convId. 用户说'给XX发消息'时, 先用这个找 convId 再调 wework_send_message. 数据来源: 本地 SQLite 历史消息.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string" },
+        name: { type: "string", description: "联系人名字 (模糊匹配)" },
+      },
+      required: ["wxId", "name"],
+    },
+    runArgs: (a: any) => ["find-contact", a.wxId, a.name, "--json"],
   },
 ];
 
