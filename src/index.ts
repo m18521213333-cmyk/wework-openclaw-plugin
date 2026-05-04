@@ -80,14 +80,6 @@ export default definePluginEntry({
   register(api: OpenClawPluginApi) {
     const logger = api.logger;
 
-    // 仅在 systemd openclaw-scrm.service 中启动 (Environment=WEWORK_PLUGIN_ENABLE=1).
-    // 其他 openclaw 进程 (默认 gateway / 手动 ssh / cron 等) 加载插件时直接 noop,
-    // 避免多个 openclaw 同时用 pluginbot 登录 Java 后端互相 squeeze.
-    if (process.env.WEWORK_PLUGIN_ENABLE !== "1") {
-      logger.info("[wework-scrm] 跳过加载 (没有 WEWORK_PLUGIN_ENABLE=1)");
-      return;
-    }
-
     // OpenClaw SDK 的 api.config 是整个 ~/.openclaw/openclaw.json 的内容,
     // 插件自己的 config 在 plugins.entries["wework-scrm"].config 里, 要手动取
     const wholeCfg = (api.config ?? {}) as Record<string, any>;
@@ -100,7 +92,8 @@ export default definePluginEntry({
       dify: { ...DEFAULT_CONFIG.dify, ...(pluginCfg.dify ?? {}) },
     };
 
-    // 注册全部 Agent 工具 (36个)
+    // 注册全部 Agent 工具 (36个) — 始终注册, 让 OpenClaw inspect/agent 都能看到 tools
+    // (避免之前 "WEWORK_PLUGIN_ENABLE 没设就 return" 导致 tool 不可见的问题)
     registerMessageTools(api);
     registerContactTools(api);
     registerGroupTools(api);
@@ -118,6 +111,14 @@ export default definePluginEntry({
       id: "wework-ws-client",
 
       async start() {
+        // WS 连接只能由 systemd-managed openclaw-scrm.service 持有 (避免多进程
+        // 同账号 squeeze). 其他 openclaw 进程 (CLI / agent / inspect) 加载
+        // plugin 时跳过 WS, 但 tools 正常注册可见.
+        if (process.env.WEWORK_PLUGIN_ENABLE !== "1") {
+          logger.info("[wework-scrm] tools 已注册, 但跳过 WS 连接 (没 WEWORK_PLUGIN_ENABLE=1)");
+          return;
+        }
+
         // 初始化 SQLite
         getDb(cfg.storage.sqlitePath);
         logger.info(`[Storage] SQLite: ${cfg.storage.sqlitePath}`);
