@@ -37,7 +37,7 @@ import { startScheduler, stopScheduler } from "./services/scheduler-service.js";
 import { startPhoneMonitor, stopPhoneMonitor } from "./services/phone-monitor.js";
 import { startContactSync, stopContactSync, handleContactPush, getLastSyncTime } from "./services/contact-sync.js";
 import { handleAiCommand } from "./services/ai-command.js";
-import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts } from "./services/storage-service.js";
+import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender } from "./services/storage-service.js";
 
 // send-helper (CLI 直接调用)
 import {
@@ -494,6 +494,44 @@ export default definePluginEntry({
             const tag = c.contact_type === 1 ? "[内部]" : c.contact_type === 2 ? "[外部]" : "[?]";
             console.log(`  ${tag} ${(c.name || "无名").padEnd(28)} ${c.alias ? "("+c.alias+") " : ""}${(c.corp_name || "")}  convId=${c.remote_id}`);
           }
+        });
+
+      // --- 拉某联系人最近发的图片/语音/视频/文件 URL (支持多张) ---
+      ww.command("recent-media")
+        .description("拿某 senderId 最近 X 分钟发的媒体 (图/音/视频/文件), 支持多张")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<senderId>", "发送方")
+        .option("-w, --within <min>", "时间窗口 (分钟)", "30")
+        .option("-n, --limit <n>", "最多几张", "10")
+        .option("--json", "JSON 输出")
+        .action((wxId: string, senderId: string, opts: { within: string; limit: string; json?: boolean }) => {
+          const within = parseInt(opts.within, 10) || 30;
+          const limit = parseInt(opts.limit, 10) || 10;
+          const list = getRecentMediaFromSender(wxId, senderId, within, limit);
+          if (opts.json) { console.log(JSON.stringify(list, null, 2)); return; }
+          if (list.length === 0) {
+            console.log(`❌ ${senderId} 最近 ${within}min 内没发图/音/视频`);
+            return;
+          }
+          console.log(`找到 ${list.length} 个媒体 (新→旧):`);
+          for (const m of list) {
+            console.log(`  [${m.ts}] ${m.contentType.padEnd(8)} ${m.url}`);
+          }
+        });
+
+      // 向后兼容
+      ww.command("last-media")
+        .description("(deprecated, 用 recent-media) 拿单条最近媒体")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<senderId>", "发送方")
+        .option("-w, --within <min>", "时间窗口 (分钟)", "30")
+        .option("--json", "JSON 输出")
+        .action((wxId: string, senderId: string, opts: { within: string; json?: boolean }) => {
+          const within = parseInt(opts.within, 10) || 30;
+          const m = getLastMediaFromSender(wxId, senderId, within);
+          if (opts.json) { console.log(JSON.stringify(m)); return; }
+          if (!m) { console.log(`❌ 没发`); return; }
+          console.log(`${m.contentType} ${m.url}`);
         });
 
       // --- 按名字找联系人 (优先 contacts 表, 然后 messages 历史) ---

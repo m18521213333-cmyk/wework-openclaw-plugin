@@ -42,7 +42,8 @@ function decodeText(b64: string): string {
 }
 
 /** 异步跑 openclaw agent, 返回 agent 的最后输出 */
-function runAgentAsync(prompt: string, timeoutMs = 90_000): Promise<string> {
+// 默认 4 分钟 — 多张图/复杂任务需要 LLM 多次 tool 调用
+function runAgentAsync(prompt: string, timeoutMs = 240_000): Promise<string> {
   return new Promise((resolve, reject) => {
     const sid = `ai-cmd-${Date.now()}`;
     const child = execFile(AI_BIN, ["agent", "--agent", "main", "--session-id", sid, "-m", prompt], {
@@ -98,7 +99,29 @@ export function handleAiCommand(ctx: CmdContext): boolean {
 
   // 异步跑 agent + 回复, 不阻塞 message handler
   // 注意 agent 跑完可能要 30-60 秒
-  const enrichedPrompt = `我企微 wxId=${ctx.wxId}, 当前会话 convId=${ctx.convId}. 用户指令: ${prompt}. 你可以用 wework__wework_find_contact 按名字找联系人 convId, wework__wework_get_history 看会话历史, wework__wework_send_message 发消息, wework__wework_post_moments 发朋友圈. 简短报告做了什么.`;
+  const enrichedPrompt = `我企微 wxId=${ctx.wxId}, 我刚发指令的 senderId=${ctx.senderId}. 用户指令: ${prompt}.
+
+可用工具:
+- wework__wework_find_contact: 按名字找联系人 convId
+- wework__wework_get_history: 看会话历史
+- wework__wework_send_message: 发文本消息 (contentType=text 默认)
+- wework__wework_send_message: 也能发图片/语音/视频, contentType=image/voice/video, content=URL
+- wework__wework_post_moments: 发朋友圈, type=text/image/link, media=[URLs]
+- wework__wework_recent_media: 拿用户在 IM 里最近发的图/音/视频/文件 URL 列表 (支持多张, senderId=${ctx.senderId})
+- wework__wework_upload: 上传服务器本地文件, 返回 URL
+
+媒体发送工作流 (用户说"把刚发的 N 张图都发给XX, 加文字Y"):
+1. wework__wework_recent_media(wxId, senderId=${ctx.senderId}, limit=N) 拿全部 N 张图的 URL 数组
+2. wework__wework_find_contact 找 XX 的 convId
+3. 先 wework__wework_send_message(wxId, convId, message=Y) 发文字
+4. 然后对每张图循环 wework__wework_send_image_url(wxId, convId, url=URL_i)
+   重要: 转发图片必须用 wework_send_image_url 不能用 wework_send_message 发 URL,
+   否则接收方看到的是文字链接不是图片!
+
+回复格式要求:
+- 用纯文本, 不要 markdown 表格 / 列表 / 代码块 (微信不渲染)
+- 不要展示 convId / remoteId / wxId 等技术 ID, 用联系人名字代替
+- 1-3 句话总结做了什么 + 是否成功, 别太长`;
 
   runAgentAsync(enrichedPrompt).then((result) => {
     // result 可能很长, 截断到合理长度避免企微 1MB 限制

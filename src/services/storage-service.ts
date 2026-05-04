@@ -206,6 +206,55 @@ export function listPhoneStatusEvents(wxId?: string, limit = 50): any[] {
 
 // 按名字模糊找联系人 — 双源合并: 先查 contacts 表 (包含全部同步过的),
 // 再 fallback 到 messages 表 (聊过的). LLM 用 "给赵丽发消息" 这种自然语言时优先调这个.
+/**
+ * 从历史消息里取某 senderId 最近的图片/语音/视频/文件 (多张).
+ * 给 LLM 用: 用户先在 IM 连发 4 张图, 再发 /ai 把刚发的图都发给XX, LLM 调这个拿全部 URL.
+ */
+export function getRecentMediaFromSender(wxId: string, senderId: string, withinMinutes = 30, limit = 10): any[] {
+  const db = getDb();
+  const rows = db.prepare(`
+    SELECT content_type, content, datetime(created_at, 'localtime') AS ts
+    FROM messages
+    WHERE wx_id=? AND sender_id=?
+      AND content_type IN ('Picture', 'Voice', 'Video', 'File', '2', '3', '4', '5')
+      AND created_at > datetime('now', '-${withinMinutes} minutes')
+    ORDER BY id DESC
+    LIMIT ?
+  `).all(wxId, senderId, limit) as any[];
+
+  return rows.map((r) => {
+    let url = "";
+    let thumbUrl = "";
+    // content 一般是 base64-encoded JSON (Java 推送时这么编)
+    // 先尝试 base64 decode 再 parse, 失败再 fallback 原始
+    const tryParse = (s: string): any | null => {
+      try { return JSON.parse(s); } catch { return null; }
+    };
+    let obj = null;
+    try {
+      const decoded = Buffer.from(r.content, "base64").toString("utf8");
+      obj = tryParse(decoded);
+    } catch { /* not base64 */ }
+    if (!obj) obj = tryParse(r.content);
+    if (obj) {
+      url = obj.url || obj.fileUrl || "";
+      thumbUrl = obj.thumbUrl || obj.coverUrl || "";
+    }
+    return {
+      contentType: r.content_type,
+      url,
+      thumbUrl,
+      ts: r.ts,
+    };
+  });
+}
+
+/** 单个最近的 (向后兼容) */
+export function getLastMediaFromSender(wxId: string, senderId: string, withinMinutes = 30): any | null {
+  const list = getRecentMediaFromSender(wxId, senderId, withinMinutes, 1);
+  return list[0] ?? null;
+}
+
 export function findContactsByName(wxId: string, namePattern: string, limit = 10): any[] {
   const db = getDb();
   const like = `%${namePattern}%`;

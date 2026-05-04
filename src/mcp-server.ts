@@ -106,7 +106,7 @@ const TOOLS = [
   },
   {
     name: "wework_send_image",
-    description: "上传本地图片并发给企业微信会话 (一条龙: upload + send).",
+    description: "上传本地图片并发给企业微信会话 (一条龙: upload + send). 适用于服务器本地路径.",
     inputSchema: {
       type: "object",
       properties: {
@@ -117,6 +117,20 @@ const TOOLS = [
       required: ["wxId", "convId", "localPath"],
     },
     runArgs: (a: any) => ["send-image", a.wxId, a.convId, a.localPath],
+  },
+  {
+    name: "wework_send_image_url",
+    description: "把已有 URL 的图片发给会话, 接收方看到的是真实图片 (不是文本链接). 转发场景必用: 从 wework_recent_media 拿到 URL 后直接调这个把图发给目标. 多张图就循环调多次.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string" },
+        convId: { type: "string", description: "目标会话 (单聊 RemoteId 或群 ConvId)" },
+        url: { type: "string", description: "图片 URL (例从 wework_recent_media 拿到的)" },
+      },
+      required: ["wxId", "convId", "url"],
+    },
+    runArgs: (a: any) => ["send", a.wxId, a.convId, a.url, "--type", "image"],
   },
   {
     name: "wework_mass_send",
@@ -326,6 +340,33 @@ const TOOLS = [
     },
     runArgs: (a: any) => ["find-contact", a.wxId, a.name, "--json"],
   },
+  {
+    name: "wework_upload",
+    description: "上传服务器本地图片/文件到图床, 返回可用 URL. 发图朋友圈/发图给会话前先用这个拿 URL.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        localPath: { type: "string", description: "服务器上文件绝对路径" },
+      },
+      required: ["localPath"],
+    },
+    runArgs: (a: any) => ["upload", a.localPath],
+  },
+  {
+    name: "wework_recent_media",
+    description: "拿用户在 IM 里最近发的图/音/视频/文件列表 (支持多张). 用户说 '把刚发的 N 张图都发给XX' 时, 先调这个拿全部 URL, 再循环调 wework_send_message 给目标方逐张发 (contentType=image/voice/video).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string" },
+        senderId: { type: "string", description: "发送方 RemoteId (触发 /ai 命令的人, 系统在 prompt 里给了)" },
+        withinMinutes: { type: "number", description: "时间窗口, 默认 30 分钟" },
+        limit: { type: "number", description: "最多几张, 默认 10" },
+      },
+      required: ["wxId", "senderId"],
+    },
+    runArgs: (a: any) => ["recent-media", a.wxId, a.senderId, "-w", String(a.withinMinutes ?? 30), "-n", String(a.limit ?? 10), "--json"],
+  },
 ];
 
 const server = new Server(
@@ -349,7 +390,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const a = args ?? {};
 
   // 1. 输入校验 (path traversal / 类型规范化)
-  if (name === "wework_send_image" && !isPathAllowed(asString((a as any).localPath))) {
+  if ((name === "wework_send_image" || name === "wework_upload") &&
+      !isPathAllowed(asString((a as any).localPath))) {
     return {
       isError: true,
       content: [{ type: "text", text: `localPath 不在白名单目录: ${ALLOWED_IMAGE_DIRS.join(", ")}` }],
