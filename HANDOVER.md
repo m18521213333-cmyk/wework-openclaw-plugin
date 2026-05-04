@@ -55,15 +55,19 @@ git push origin main             # 用户名输 m18521213333-cmyk, 密码输 PAT
 
 ### 2. 轮换密码 (10 分钟, 重要!)
 
-今天我看到 / 我们对话里出现过的凭据 (公开过的, 必须换):
+> ⚠️ 此前 commit 历史里有过明文密码 (5/3 凌晨调试时). 公开仓库后需要先轮换
+> 全部凭据再 push, 或者用 `git filter-repo` 清掉历史 (任选其一).
 
-| 系统 | 当前密码 | 改法 |
+需要换的全部凭据 — **真实值看你服务器上 application.properties / openclaw.json**, 这里只列怎么改:
+
+| 系统 | 在哪儿读 | 怎么换 |
 |---|---|---|
-| MySQL `wework` 用户 | `Wework@Scrm2026!` | `mysql -uroot -p; SET PASSWORD FOR 'wework'@'localhost'=PASSWORD('新密码'); FLUSH PRIVILEGES;` 然后改 `/opt/wework/wework-server/src/main/resources/application.properties` 的 `spring.datasource.password` 重启 wework-server |
-| Redis | (在 application.properties) | 同上, 改 `spring.redis.password` |
-| Dify Key | `app-ClyQIYixmknsVkYrH7QmWYib` | 在 `https://chat-dify.cloud.zjian.net/` 控制台重新生成 + 改 application.properties + 删除 install.sh 里的硬编码 |
-| pctest web 账号 | `123456` | 太弱了, 直接改 MySQL `tbl_accountinfo SET password='强密码' WHERE account='pctest'` |
-| pluginbot / pluginbot-cli | `botp4ss2026` / `clip4ss2026` | 同上 + 同步改 `~/.openclaw/openclaw.json` 里 `auth.password` 和 `auth.cliPassword` |
+| MySQL `wework` 用户 | `/opt/wework/wework-server/src/main/resources/application.properties` 里 `spring.datasource.password` | `mysql -uroot -p; SET PASSWORD FOR 'wework'@'localhost'=PASSWORD('新密码'); FLUSH PRIVILEGES;` 然后改 properties + 重启 wework-server |
+| Redis | application.properties 里 `spring.redis.password` | 改 redis conf + properties + 双重启 |
+| Dify Key | application.properties 里 `dify.key` | https://chat-dify.cloud.zjian.net/ 控制台 revoke + 重新生成 + 改 properties + 删 install.sh 里的硬编码 |
+| pctest web 账号 (pwd=`123456` 太弱) | MySQL `tbl_accountinfo` | `UPDATE tbl_accountinfo SET password='强密码' WHERE account='pctest';` |
+| pluginbot / pluginbot-cli | `~/.openclaw/openclaw.json` 里 `auth.password` / `auth.cliPassword` | 改 MySQL `tbl_accountinfo` 对应 password + 同步改 openclaw.json + restart openclaw-scrm |
+| Kimi API Key | `/etc/systemd/system/openclaw-scrm.service.d/llm-env.conf` 里 `KIMI_API_KEY` 等 | https://platform.moonshot.cn/console/api-keys revoke + 重新生成 + 改 systemd file + daemon-reload + restart |
 
 ### 3. 试试新群发 + 欢迎完整闭环
 

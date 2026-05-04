@@ -344,11 +344,71 @@ export default definePluginEntry({
       }
 
       // --- 状态 ---
-      ww.command("status").description("查看连接状态").action(withConnection(async () => {
-        const c = getWeWorkClient();
-        if (!c) { console.log("❌ 插件未启动"); return; }
-        console.log(`Java 后端: ${c.connected ? "✅ 已连接" : "❌ 未连接"} (${cfg.javaWsUrl})`);
-      }));
+      // 综合健康检查: WS 连接 + 手机 SDK isonline + 系统资源
+      // 加 --json 给 MCP server / 自动化 用
+      ww.command("status")
+        .description("查 WS 连接 + 手机在线 + 系统综合状态")
+        .option("--json", "JSON 输出 (给程序读)")
+        .option("--wx-id <id>", "查指定 wxId 的手机状态, 默认所有")
+        .action(withConnection(async (opts: { json?: boolean; wxId?: string }) => {
+          const c = getWeWorkClient();
+          const wsConnected = c?.connected ?? false;
+          const result: any = {
+            ts: new Date().toISOString(),
+            ws: { connected: wsConnected, url: cfg.javaWsUrl },
+            phones: [] as Array<{ wxId: string; name: string; online: boolean }>,
+            warnings: [] as string[],
+          };
+
+          // 查 MySQL 看手机 SDK 在线状态 (isonline=0 表示真在线, 1=离线)
+          try {
+            const propsPath = "/opt/wework/wework-server/src/main/resources/application.properties";
+            if (fs.existsSync(propsPath)) {
+              const props = fs.readFileSync(propsPath, "utf8");
+              const dbUser = props.match(/^spring\.datasource\.username=(.+)$/m)?.[1]?.trim() ?? "wework";
+              const dbPass = props.match(/^spring\.datasource\.password=(.+)$/m)?.[1]?.trim() ?? "";
+              const dbName = props.match(/jdbc:mysql:\/\/[^/]+\/([^?]+)/)?.[1] ?? "workchat";
+              if (dbPass) {
+                const filter = opts.wxId ? `WHERE wxid=${opts.wxId}` : `WHERE wxid IS NOT NULL`;
+                const sql = `SELECT wxid, name, isonline FROM tbl_wx_accountinfo ${filter};`;
+                const { execFileSync } = await import("node:child_process");
+                const out = execFileSync("mysql", ["-u", dbUser, "-N", "-B", dbName, "-e", sql],
+                  { env: { ...process.env, MYSQL_PWD: dbPass }, encoding: "utf8", timeout: 5000 });
+                for (const line of out.trim().split("\n")) {
+                  const [wxId, name, isonlineStr] = line.split("\t");
+                  if (!wxId) continue;
+                  const online = isonlineStr === "0";
+                  result.phones.push({ wxId, name, online });
+                  if (!online) result.warnings.push(`手机 ${name}(${wxId}) SDK 离线 (isonline=${isonlineStr}) — 客户消息发不到!`);
+                }
+              }
+            }
+          } catch (e: any) {
+            result.warnings.push(`无法查 MySQL phone status: ${e.message}`);
+          }
+
+          if (!wsConnected) result.warnings.push("Java WS 未连接, 收发都会失败");
+
+          if (opts.json) {
+            console.log(JSON.stringify(result, null, 2));
+            return;
+          }
+
+          // 人类可读输出
+          console.log(`Java WS:    ${wsConnected ? "✅ 已连接" : "❌ 未连接"} (${cfg.javaWsUrl})`);
+          if (result.phones.length === 0) {
+            console.log("手机 SDK:   ⚠️  无数据 (查不到 tbl_wx_accountinfo)");
+          } else {
+            for (const p of result.phones) {
+              console.log(`手机 SDK:   ${p.online ? "✅ 在线" : "❌ 离线"} ${p.name}(${p.wxId})`);
+            }
+          }
+          if (result.warnings.length > 0) {
+            console.log("");
+            console.log("⚠️  警告:");
+            for (const w of result.warnings) console.log(`  - ${w}`);
+          }
+        }));
 
       // --- 发消息 ---
       ww.command("send")

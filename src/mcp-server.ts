@@ -29,6 +29,29 @@ const execFileAsync = promisify(execFile);
 
 const WEWORK_BIN = process.env.WEWORK_BIN || "/usr/local/bin/wework";
 
+// 安全: send-image 接的 localPath 是 LLM 决定的, 限制只能是这些目录, 防 path traversal
+// + LLM 看到 /etc/passwd 当图片传出去
+const ALLOWED_IMAGE_DIRS = [
+  "/tmp/",
+  "/app/storage/attachment/",
+  "/root/uploads/",
+];
+
+function isPathAllowed(p: string): boolean {
+  if (!p || typeof p !== "string") return false;
+  // 必须绝对路径 + 不含 .. + 必须在白名单目录下
+  if (!p.startsWith("/")) return false;
+  if (p.includes("..")) return false;
+  return ALLOWED_IMAGE_DIRS.some((d) => p.startsWith(d));
+}
+
+// 安全: int64 字段 LLM 可能传 number, 我们要确保字符串化
+function asString(v: any): string {
+  if (typeof v === "string") return v;
+  if (typeof v === "number" || typeof v === "bigint") return String(v);
+  return "";
+}
+
 /** 跑一条 wework CLI, 返回 stdout */
 async function runWework(args: string[], timeoutMs = 30_000): Promise<string> {
   const { stdout, stderr } = await execFileAsync(WEWORK_BIN, args, {
@@ -37,6 +60,32 @@ async function runWework(args: string[], timeoutMs = 30_000): Promise<string> {
     maxBuffer: 5 * 1024 * 1024,
   });
   return (stdout + (stderr ? `\n[stderr]\n${stderr}` : "")).trim();
+}
+
+/** 直查 MySQL 看手机 SDK 是否在线 (绕开 wework status, 它要起 WS 太慢) */
+async function checkPhoneOnline(wxId: string): Promise<{ ok: boolean; reason?: string }> {
+  try {
+    const fs = await import("node:fs");
+    const propsPath = "/opt/wework/wework-server/src/main/resources/application.properties";
+    if (!fs.existsSync(propsPath)) return { ok: true }; // 没配置就乐观
+    const props = fs.readFileSync(propsPath, "utf8");
+    const dbUser = props.match(/^spring\.datasource\.username=(.+)$/m)?.[1]?.trim() ?? "wework";
+    const dbPass = props.match(/^spring\.datasource\.password=(.+)$/m)?.[1]?.trim() ?? "";
+    const dbName = props.match(/jdbc:mysql:\/\/[^/]+\/([^?]+)/)?.[1] ?? "workchat";
+    if (!dbPass) return { ok: true };
+    const sql = `SELECT name, isonline FROM tbl_wx_accountinfo WHERE wxid=${wxId};`;
+    const { stdout } = await execFileAsync("mysql", ["-u", dbUser, "-N", "-B", dbName, "-e", sql], {
+      env: { ...process.env, MYSQL_PWD: dbPass }, encoding: "utf8", timeout: 5_000,
+    });
+    const line = stdout.trim().split("\n")[0];
+    if (!line) return { ok: true }; // 没找到该 wxId, 不阻塞
+    const [name, isonlineStr] = line.split("\t");
+    if (isonlineStr === "0") return { ok: true }; // 在线
+    return { ok: false, reason: `手机 SDK 离线 (${name}, isonline=${isonlineStr}), 消息发不出去. 提醒用户在工作手机上重新登录 SCRM App` };
+  } catch (e: any) {
+    process.stderr.write(`[mcp-check] error: ${e.message}\n`);
+    return { ok: true }; // 查询失败时不阻塞 (避免阻塞业务)
+  }
 }
 
 /** MCP tool 定义 — name 必须跟 OpenClaw agent 调用时一致 */
@@ -185,14 +234,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       content: [{ type: "text", text: `unknown tool: ${name}` }],
     };
   }
+  const a = args ?? {};
+
+  // 1. 输入校验 (path traversal / 类型规范化)
+  if (name === "wework_send_image" && !isPathAllowed(asString((a as any).localPath))) {
+    return {
+      isError: true,
+      content: [{ type: "text", text: `localPath 不在白名单目录: ${ALLOWED_IMAGE_DIRS.join(", ")}` }],
+    };
+  }
+
+  // 2. 发送类: 先查手机在线, 离线就拒绝 (防止 LLM 报错误的 "成功")
+  const sendingTools = new Set([
+    "wework_send_message", "wework_send_image", "wework_mass_send",
+    "wework_post_moments", "wework_create_group",
+  ]);
+  if (sendingTools.has(name)) {
+    const wxId = asString((a as any).wxId);
+    if (wxId) {
+      const check = await checkPhoneOnline(wxId);
+      if (!check.ok) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `❌ 操作中止: ${check.reason}` }],
+        };
+      }
+    }
+  }
+
+  // 3. 真正执行
   try {
-    const cliArgs = tool.runArgs(args ?? {});
+    const cliArgs = tool.runArgs(a);
     const out = await runWework(cliArgs);
     return { content: [{ type: "text", text: out }] };
   } catch (e: any) {
     return {
       isError: true,
-      content: [{ type: "text", text: `wework ${tool.runArgs(args ?? {}).join(" ")} failed: ${e.message}\n${e.stdout ?? ""}\n${e.stderr ?? ""}` }],
+      content: [{ type: "text", text: `wework ${tool.runArgs(a).join(" ")} failed: ${e.message}\n${e.stdout ?? ""}\n${e.stderr ?? ""}` }],
     };
   }
 });
