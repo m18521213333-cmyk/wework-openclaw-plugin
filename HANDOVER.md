@@ -178,7 +178,7 @@ exec env WEWORK_PLUGIN_ENABLE=1 openclaw wework "$@"
 ## 已知遗留 / 未来工作
 
 1. **LLM Agent 自然语言驱动** — 等你提供 API key 接入
-2. **wework upload 自动连发** — 当前 upload 输出 URL 后要手动复制粘贴, 未来加一个 `wework send-image <wxId> <convId> <localPath>` 一条命令搞定
+2. ~~**wework upload 自动连发**~~ — ✅ 已实现 `wework send-image <wxId> <convId> <localPath>`, 一条龙上传+发送 (b621859 之后某个 commit, SSH 卡死还没 deploy)
 3. **群操作 dashed action 名字** — 当前用下划线 (set_name/add_member), 想用 PascalCase (RoomName/AddMember) 也可以, 只是 CLI 风格
 4. **pending_tasks 还能扩展** — 不只用于建群+欢迎, 还可以做"加好友成功后自动打标签"等异步链
 5. **撤回 / 转发 CLI 没实战测过** — 命令注册了但没找到合适的 msgId 测, 协议跟 send 一致应该 work

@@ -164,6 +164,7 @@ systemctl restart openclaw-scrm.service
 |---|---|
 | `wework send <wxId> <convId> <text>` | 发文本消息 |
 | `wework send <wxId> <convId> <imageURL> --type image` | 发图片消息 (URL 必须可被手机 SDK 下载) |
+| `wework send-image <wxId> <convId> <localPath>` | 一条龙: 上传本地图片 + 发出去 (省去复制 URL 的步骤) |
 | `wework mass-send <wxId> <text> --to id1 id2 id3` | 群发 (内部循环 sendMessage) |
 | `wework moments <wxId> <文案>` | 发纯文朋友圈 |
 | `wework moments <wxId> <文案> --type image --media url1 url2` | 发带图朋友圈 |
@@ -207,13 +208,16 @@ wework group <wxId> set_remark --group <convId> --content "我的备注"
 ### 文件上传 + 发图
 
 ```bash
-# 1. 上传本地图片到服务器图床, 输出 URL
+# 一条龙: 上传 + 发给会话 (推荐)
+wework send-image 1688852285335663 7881300944899375 /path/to/local.jpg
+
+# 拆分: 先上传拿 URL
 URL=$(wework upload /path/to/local.jpg | tail -1 | awk '{print $2}')
 
-# 2. 用 URL 发图给客户
+# 然后用 URL 发图给客户
 wework send 1688852285335663 7881300944899375 "$URL" --type image
 
-# 3. 或发到朋友圈
+# 或发到朋友圈 (没法用 send-image, 朋友圈格式不同)
 wework moments 1688852285335663 "新品上架" --type image --media "$URL"
 ```
 

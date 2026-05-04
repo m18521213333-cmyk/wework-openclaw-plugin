@@ -504,43 +504,65 @@ export default definePluginEntry({
 
       // --- 上传本地文件 → 拽 URL ---
       // 之后用: wework send <wxId> <convId> <URL> --type image
+      // 或一条龙: wework send-image <wxId> <convId> <localPath>
+      const DEFAULT_UPLOAD_URL = "http://127.0.0.1:15086/fileUpload";
+      async function uploadLocalFile(localPath: string, uploadUrl: string): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
+        if (!fs.existsSync(localPath)) {
+          return { ok: false, error: `文件不存在: ${localPath}` };
+        }
+        const fileBuf = fs.readFileSync(localPath);
+        const fileName = path.basename(localPath);
+        const boundary = `----wework${Date.now()}`;
+        const head = Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="myfile"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+          "utf8",
+        );
+        const tail = Buffer.from(`\r\n--${boundary}--\r\n`, "utf8");
+        const body = Buffer.concat([head, fileBuf, tail]);
+        try {
+          const res = await fetch(uploadUrl, {
+            method: "POST",
+            headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
+            body,
+          });
+          const text = await res.text();
+          const json = JSON.parse(text);
+          const url = json?.data?.url;
+          if (url) return { ok: true, url };
+          return { ok: false, error: `上传 API 没返回 url: ${text.slice(0, 200)}` };
+        } catch (e: any) {
+          return { ok: false, error: e.message };
+        }
+      }
+
       ww.command("upload")
         .description("上传本地文件到服务器图床, 输出 URL")
         .argument("<localPath>", "本地文件绝对路径")
-        .option("--upload-url <url>", "fileUpload 接口 URL", "http://127.0.0.1:15086/fileUpload")
+        .option("--upload-url <url>", "fileUpload 接口 URL", DEFAULT_UPLOAD_URL)
         .action(async (localPath: string, opts: { uploadUrl: string }) => {
           // 注意: 此命令不需要连 Java WS, 只是 HTTP POST
-          if (!fs.existsSync(localPath)) {
-            console.log(`❌ 文件不存在: ${localPath}`);
+          const r = await uploadLocalFile(localPath, opts.uploadUrl);
+          console.log(r.ok ? `✅ ${r.url}` : `❌ ${r.error}`);
+        });
+
+      // --- 一条龙: 本地图 → 上传 → 发给客户/群 ---
+      // 替代手动 wework upload <path> 然后复制 url 再 wework send
+      ww.command("send-image")
+        .description("上传本地图片并发送给目标会话 (一条龙)")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<convId>", "目标会话ID (单聊客户 RemoteId 或群 ConvId)")
+        .argument("<localPath>", "本地图片绝对路径")
+        .option("--upload-url <url>", "fileUpload 接口 URL", DEFAULT_UPLOAD_URL)
+        .action(withConnection(async (wxId: string, convId: string, localPath: string, opts: { uploadUrl: string }) => {
+          const up = await uploadLocalFile(localPath, opts.uploadUrl);
+          if (!up.ok) {
+            console.log(`❌ 上传失败: ${up.error}`);
             return;
           }
-          const fileBuf = fs.readFileSync(localPath);
-          const fileName = path.basename(localPath);
-          const boundary = `----wework${Date.now()}`;
-          const head = Buffer.from(
-            `--${boundary}\r\nContent-Disposition: form-data; name="myfile"; filename="${fileName}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
-            "utf8",
-          );
-          const tail = Buffer.from(`\r\n--${boundary}--\r\n`, "utf8");
-          const body = Buffer.concat([head, fileBuf, tail]);
-          try {
-            const res = await fetch(opts.uploadUrl, {
-              method: "POST",
-              headers: { "Content-Type": `multipart/form-data; boundary=${boundary}` },
-              body,
-            });
-            const text = await res.text();
-            const json = JSON.parse(text);
-            const url = json?.data?.url;
-            if (url) {
-              console.log(`✅ ${url}`);
-            } else {
-              console.log(`❌ 上传失败: ${text.slice(0, 200)}`);
-            }
-          } catch (e: any) {
-            console.log(`❌ 上传出错: ${e.message}`);
-          }
-        });
+          console.log(`✅ 上传完成: ${up.url}`);
+          const r = sendMessage(wxId, convId, up.url, "image");
+          console.log(r.success ? `✅ 图片已发送 → ${convId}` : `❌ 发送失败: ${r.error}`);
+        }));
 
     }, { commands: ["wework"] });
 
