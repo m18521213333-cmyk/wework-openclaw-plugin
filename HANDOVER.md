@@ -182,7 +182,11 @@ exec env WEWORK_PLUGIN_ENABLE=1 openclaw wework "$@"
 3. **群操作 dashed action 名字** — 当前用下划线 (set_name/add_member), 想用 PascalCase (RoomName/AddMember) 也可以, 只是 CLI 风格
 4. **pending_tasks 还能扩展** — 不只用于建群+欢迎, 还可以做"加好友成功后自动打标签"等异步链
 5. **撤回 / 转发 CLI 没实战测过** — 命令注册了但没找到合适的 msgId 测, 协议跟 send 一致应该 work
-6. **sshd fork 资源耗尽 是个反复出现问题** — 凌晨 4:00 / 早 9:51 都出现过 banner timeout. 业务服务不受影响 (wework-server / openclaw-scrm 仍正常工作), 只是新 SSH 连不上. 临时修法: 阿里云控制台重启实例. 长期: 排查谁在 fork 大量进程 (`ps -eLf | wc -l` 看线程总数, `cat /proc/sys/kernel/pid_max` 看上限). HANDOVER.md 第 192 行原本就提了, 这次又复发. 优先级中上, 不是 P0 但你迟早要修.
+6. ~~**sshd fork 资源耗尽**~~ — ✅ **已根治** (12:53). 真凶不是 sshd 不是 fork, 是**内存严重不够 + 没 swap**:
+   - 3.4G RAM, Java 占 860M / MySQL 386M / OpenClaw 372M, 实际可用只剩 342M
+   - SSH 要 fork+exec 新 bash 时内核分不出内存 → fork 失败 → banner timeout
+   - 修法: `fallocate -l 2G /swapfile && mkswap && swapon`, 写 fstab, swappiness=10
+   - 现在: 2.4G 余量, 不会再随机卡死
 
 ## 故障排查速查
 
