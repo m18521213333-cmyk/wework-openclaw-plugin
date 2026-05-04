@@ -385,8 +385,20 @@ export function downloadByUrl(wxId: string, url: string): SendResult {
   return sendToJava("DownloadFileByUrlTask", { WxId: String(wxId), Url: url });
 }
 
-export function downloadByMsgId(wxId: string, msgId: string): SendResult {
-  return sendToJava("DownloadFileByMsgIdTask", { WxId: String(wxId), MsgId: String(msgId) });
+/**
+ * 触发 Java 让手机 SDK 上传指定 msgId 对应的媒体文件到图床.
+ * 需要传 MsgRemoteId + FileType 才能让 SDK 真响应 (web 端实测).
+ *   FileType: 0=原始文件 (适用所有 原图/视频/音频/文件)
+ *             1=大图 4=语音 5=视频 6=文件
+ */
+export function downloadByMsgId(wxId: string, msgId: string, msgRemoteId?: string, fileType: number = 0): SendResult {
+  return sendToJava("DownloadFileByMsgIdTask", {
+    WxId: String(wxId),
+    MsgId: String(msgId),
+    MsgRemoteId: String(msgRemoteId ?? ""),
+    FileType: fileType,
+    TaskId: String(Date.now()),
+  });
 }
 
 export function triggerSync(wxId: string, dataType: string): SendResult {

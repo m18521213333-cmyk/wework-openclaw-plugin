@@ -37,7 +37,7 @@ import { startScheduler, stopScheduler } from "./services/scheduler-service.js";
 import { startPhoneMonitor, stopPhoneMonitor } from "./services/phone-monitor.js";
 import { startContactSync, stopContactSync, handleContactPush, getLastSyncTime } from "./services/contact-sync.js";
 import { handleAiCommand } from "./services/ai-command.js";
-import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender } from "./services/storage-service.js";
+import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getMessageMeta } from "./services/storage-service.js";
 
 // send-helper (CLI 直接调用)
 import {
@@ -242,6 +242,25 @@ export default definePluginEntry({
 
             // 新会话通知 (建群完成等异步操作的回调)
             // 用于跨进程 IPC: CLI 写入 pending_tasks 后退出, service 这边收到推送匹配执行
+            // Java 通知文件下载完成 (视频/文件转发的关键 notice)
+            // 字段: WxId, Success, ErrMsg, OrgUrl, Url, FileType (1大图 4语音 5视频 6文件), TaskId, MsgId
+            if (msgType === "DownloadFileResultNotice") {
+              const success = content.Success ?? content.success ?? false;
+              const newUrl = String(content.Url ?? content.url ?? "");
+              const msgId = String(content.MsgId ?? content.msgId ?? "");
+              const fileType = content.FileType ?? content.fileType;
+              const errMsg = content.ErrMsg ?? content.errMsg;
+              const ftNum = typeof fileType === "number" ? fileType : undefined;
+              const errStr = typeof errMsg === "string" ? errMsg : undefined;
+              if (success && newUrl && msgId) {
+                recordResolvedMediaUrl(msgId, newUrl, ftNum, true);
+                logger.info(`[Download] ✅ msgId=${msgId} fileType=${fileType} → ${newUrl}`);
+              } else if (msgId) {
+                recordResolvedMediaUrl(msgId, "", ftNum, false, errStr);
+                logger.warn(`[Download] ❌ msgId=${msgId} fileType=${fileType} success=${success} err="${errStr ?? ""}"`);
+              }
+            }
+
             if (msgType === "ConversationAddNotice") {
               const conv = (content.Convers ?? (content as any).convers) as any;
               const groupName = conv?.Name ?? conv?.name;
@@ -497,57 +516,62 @@ export default definePluginEntry({
           }
         });
 
-      // --- 解析视频/文件 URL (Java 没自动转存的, 触发下载到图床后返回真 URL) ---
+      // --- 触发 Java 让手机 SDK 上传媒体到图床 + 等 DownloadFileResultNotice 回写真 URL ---
       ww.command("resolve-media")
-        .description("视频/文件 Java 没存图床时, 触发下载 + 等到位 + 返回真 URL")
+        .description("视频/文件 Java 没存图床时, 触发手机上传 + 等 Result 通知 + 返回真 URL")
         .argument("<wxId>", "企业微信ID")
         .argument("<msgId>", "消息 MsgId (从 history 拿)")
-        .option("-w, --wait <s>", "最大等待秒数", "30")
+        .option("-w, --wait <s>", "最大等待秒数 (大文件可加大)", "60")
+        .option("-t, --file-type <n>", "FileType: 0=原始(默认通用) 1=大图 4=语音 5=视频 6=文件", "0")
         .option("--json", "JSON 输出")
-        .action(withConnection(async (wxId: string, msgId: string, opts: { wait: string; json?: boolean }) => {
-          const waitSec = parseInt(opts.wait, 10) || 30;
-          // 1. 找原 message 拿 url 里的 hash
-          const db = getDb(cfg.storage.sqlitePath);
-          const row = db.prepare("SELECT content FROM messages WHERE wx_id=? AND msg_id=? LIMIT 1").get(wxId, msgId) as any;
-          if (!row) {
+        .action(withConnection(async (wxId: string, msgId: string, opts: { wait: string; fileType: string; json?: boolean }) => {
+          const waitSec = parseInt(opts.wait, 10) || 60;
+          const fileType = parseInt(opts.fileType, 10) || 0;
+          // 1. 拿 msg_remote_id (Java 协议要求, web 端实测必传)
+          const meta = getMessageMeta(wxId, msgId);
+          if (!meta) {
             console.log(opts.json ? JSON.stringify({ ok: false, error: "msg not found" }) : `❌ msgId=${msgId} 不在本地 messages 表`);
             return;
           }
-          let originalUrl = "";
-          try {
-            const decoded = Buffer.from(row.content, "base64").toString("utf8");
-            originalUrl = JSON.parse(decoded).url || "";
-          } catch { try { originalUrl = JSON.parse(row.content).url || ""; } catch {} }
-          // 提取 hash (MD5 32 hex chars)
-          const hashMatch = originalUrl.match(/([a-fA-F0-9]{32})\.[a-z0-9]+/);
-          if (!hashMatch) {
-            console.log(opts.json ? JSON.stringify({ ok: false, error: "no hash in url" }) : `❌ url 里没找到 MD5 hash: ${originalUrl}`);
-            return;
-          }
-          const hash = hashMatch[1].toUpperCase();
-          // 2. 触发下载
-          const trig = downloadByMsgId(wxId, msgId);
+          const msgRemoteId = meta.msg_remote_id ?? "";
+          // 2. 触发下载 (含 MsgRemoteId + FileType, 否则手机 SDK 不响应)
+          const trig = downloadByMsgId(wxId, msgId, String(msgRemoteId), fileType);
           if (!trig.success) {
             console.log(opts.json ? JSON.stringify({ ok: false, error: trig.error }) : `❌ 触发下载失败: ${trig.error}`);
             return;
           }
-          // 3. 等文件出现
-          const dirs = ["20260505", "20260504", "20260503"]; // 简单查最近 3 天
+          // 3. 等 DownloadFileResultNotice 回写 (内存里那个 _resolvedMediaUrls map)
+          // 注意 service 进程才会收到 notice, CLI 这个进程是新连接, 自己不收 notice.
+          // 所以这里的等待依赖 service 进程在 notice 来时更新 SQLite (TODO 加).
+          // 当前 fallback: poll 文件系统 + memory map (各自检查)
           const startMs = Date.now();
           let foundUrl = "";
+          // 也保留文件系统 fallback
+          const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+          const yesterday = new Date(Date.now() - 86400_000).toISOString().slice(0, 10).replace(/-/g, "");
+          let originalUrl = "";
+          try {
+            const decoded = Buffer.from(meta.content, "base64").toString("utf8");
+            originalUrl = JSON.parse(decoded).url || "";
+          } catch { try { originalUrl = JSON.parse(meta.content).url || ""; } catch {} }
+          const hashMatch = originalUrl.match(/([a-fA-F0-9]{32})/);
+          const hash = hashMatch?.[1]?.toUpperCase() ?? "";
+
           while (Date.now() - startMs < waitSec * 1000) {
-            for (const date of dirs) {
-              const dir = `/app/storage/attachment/${date}`;
-              if (fs.existsSync(dir)) {
-                const entries = fs.readdirSync(dir);
-                const match = entries.find((f) => f.toUpperCase().startsWith(hash + "."));
-                if (match) {
-                  foundUrl = `http://60.205.94.161/attachment/${date}/${match}`;
-                  break;
+            // 优先查 memory map (DownloadFileResultNotice 推送)
+            const mem = getResolvedMediaUrl(msgId);
+            if (mem) { foundUrl = mem; break; }
+            // 备用: 文件系统 hash 匹配
+            if (hash) {
+              for (const date of [today, yesterday]) {
+                const dir = `/app/storage/attachment/${date}`;
+                if (fs.existsSync(dir)) {
+                  const match = fs.readdirSync(dir).find((f) => f.toUpperCase().startsWith(hash + "."));
+                  if (match) { foundUrl = `http://60.205.94.161/attachment/${date}/${match}`; break; }
                 }
               }
+              if (foundUrl) break;
             }
-            if (foundUrl) break;
             await new Promise((r) => setTimeout(r, 1500));
           }
           if (foundUrl) {
@@ -555,7 +579,7 @@ export default definePluginEntry({
               : `✅ 已到位 (${Math.round((Date.now() - startMs) / 1000)}s): ${foundUrl}`);
           } else {
             console.log(opts.json ? JSON.stringify({ ok: false, error: "timeout", hash, waitedSec: waitSec })
-              : `❌ ${waitSec}s 内文件没出现 (hash=${hash}). 可能 Java 下载失败 or 文件特别大.`);
+              : `❌ ${waitSec}s 内手机 SDK 没响应. 可能视频/文件 SDK 不支持自动上传.`);
           }
         }));
 

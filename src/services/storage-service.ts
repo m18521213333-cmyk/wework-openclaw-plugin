@@ -177,6 +177,17 @@ function initTables(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_contacts_wxid_name ON contacts(wx_id, name);
     CREATE INDEX IF NOT EXISTS idx_contacts_wxid_alias ON contacts(wx_id, alias);
+
+    -- 视频/文件 resolve 后的真 URL (跨进程: service 监听 DownloadFileResultNotice
+    -- 写, CLI/agent 读). 配合 resolve-media 命令实现自动转发.
+    CREATE TABLE IF NOT EXISTS resolved_media (
+      msg_id TEXT PRIMARY KEY,
+      url TEXT NOT NULL,
+      file_type INTEGER,
+      success INTEGER NOT NULL DEFAULT 1,
+      err_msg TEXT,
+      ts TEXT DEFAULT (datetime('now'))
+    );
   `);
 }
 
@@ -284,6 +295,47 @@ export function getRecentMediaFromSender(wxId: string, senderId: string, withinM
 export function getLastMediaFromSender(wxId: string, senderId: string, withinMinutes = 30): any | null {
   const list = getRecentMediaFromSender(wxId, senderId, withinMinutes, 1);
   return list[0] ?? null;
+}
+
+// 内存里记 msgId → 已下载到图床的真实 URL
+// 由 DownloadFileResultNotice 推送时填进来, resolve-media 命令轮询
+const _resolvedMediaUrls = new Map<string, { url: string; ts: number }>();
+
+export function recordResolvedMediaUrl(msgId: string, url: string, fileType?: number, success = true, errMsg?: string): void {
+  if (!msgId) return;
+  _resolvedMediaUrls.set(msgId, { url, ts: Date.now() });
+  // 同时写 SQLite 跨进程同步 (CLI/agent 进程能查到)
+  try {
+    const db = getDb();
+    db.prepare(`
+      INSERT INTO resolved_media (msg_id, url, file_type, success, err_msg, ts)
+      VALUES (?, ?, ?, ?, ?, datetime('now'))
+      ON CONFLICT(msg_id) DO UPDATE SET
+        url=excluded.url,
+        file_type=excluded.file_type,
+        success=excluded.success,
+        err_msg=excluded.err_msg,
+        ts=datetime('now')
+    `).run(msgId, url ?? "", fileType ?? null, success ? 1 : 0, errMsg ?? null);
+  } catch { /* ignore */ }
+}
+
+export function getResolvedMediaUrl(msgId: string): string | null {
+  // 先查内存 (service 进程自己写的最快)
+  const mem = _resolvedMediaUrls.get(msgId)?.url;
+  if (mem) return mem;
+  // 再查 SQLite (跨进程)
+  try {
+    const db = getDb();
+    const r = db.prepare("SELECT url, success FROM resolved_media WHERE msg_id=?").get(msgId) as any;
+    return r?.success ? r.url : null;
+  } catch { return null; }
+}
+
+// 给 resolve-media 用: 顺便从 messages 表读 msg_remote_id
+export function getMessageMeta(wxId: string, msgId: string): any | null {
+  const db = getDb();
+  return db.prepare("SELECT msg_id, msg_remote_id, content_type, content FROM messages WHERE wx_id=? AND msg_id=? LIMIT 1").get(wxId, msgId);
 }
 
 export function findContactsByName(wxId: string, namePattern: string, limit = 10): any[] {
