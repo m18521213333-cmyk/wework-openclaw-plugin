@@ -36,6 +36,7 @@ import { checkKeywordReply, checkAutoAcceptFriend, persistMessage } from "./serv
 import { startScheduler, stopScheduler } from "./services/scheduler-service.js";
 import { startPhoneMonitor, stopPhoneMonitor } from "./services/phone-monitor.js";
 import { startContactSync, stopContactSync, handleContactPush, getLastSyncTime } from "./services/contact-sync.js";
+import { handleAiCommand } from "./services/ai-command.js";
 import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts } from "./services/storage-service.js";
 
 // send-helper (CLI 直接调用)
@@ -172,15 +173,32 @@ export default definePluginEntry({
                 isSend: "false", createTime: d.CreateTime,
               });
 
-              const handled = checkKeywordReply(
-                String(d.WxId), String(d.ConvId), d.Content ?? "", d.ContentType ?? 0, logger,
-              );
+              // /ai 命令优先 (你个人微信 → 孟伟企微 发 "/ai 给客户XX发祝福")
+              // allowedSenders 白名单从 plugin config 读, 支持你个人微信对应的外部 RemoteId
+              const aiAllowedSenders: string[] =
+                (cfg as any).ai?.allowedSenders ?? (pluginCfg as any).ai?.allowedSenders ?? [];
+              const aiHandled = handleAiCommand({
+                wxId: String(d.WxId ?? ""),
+                convId: String(d.ConvId ?? ""),
+                senderId: String(d.SenderId ?? ""),
+                senderName: d.SenderName,
+                contentBase64: d.Content ?? "",
+                contentType: d.ContentType ?? 0,
+                allowedSenders: aiAllowedSenders,
+                logger,
+              });
 
-              if (!handled && cfg.dify.enabled) {
-                await handleAiReply(
-                  String(d.WxId), String(d.ConvId), String(d.SenderId), d.SenderName ?? "", d.Content ?? "",
-                  { apiUrl: cfg.dify.apiUrl!, apiKey: cfg.dify.apiKey! }, logger,
+              if (!aiHandled) {
+                const handled = checkKeywordReply(
+                  String(d.WxId), String(d.ConvId), d.Content ?? "", d.ContentType ?? 0, logger,
                 );
+
+                if (!handled && cfg.dify.enabled) {
+                  await handleAiReply(
+                    String(d.WxId), String(d.ConvId), String(d.SenderId), d.SenderName ?? "", d.Content ?? "",
+                    { apiUrl: cfg.dify.apiUrl!, apiKey: cfg.dify.apiKey! }, logger,
+                  );
+                }
               }
             }
 
