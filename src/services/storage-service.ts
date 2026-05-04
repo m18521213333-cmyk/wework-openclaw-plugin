@@ -141,7 +141,45 @@ function initTables(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_tasks(status, task_type);
     CREATE INDEX IF NOT EXISTS idx_pending_match ON pending_tasks(match_key, status);
+
+    -- 手机 SDK 在线/离线 状态变化事件 (P2 监控)
+    -- 由 service 后台轮询 Java MySQL tbl_wx_accountinfo, 状态变化时落库
+    CREATE TABLE IF NOT EXISTS phone_status_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      wx_id TEXT NOT NULL,
+      name TEXT,
+      from_state TEXT NOT NULL,    -- 'online' | 'offline' | 'unknown'
+      to_state TEXT NOT NULL,
+      duration_sec INTEGER,         -- 上一状态持续多久
+      ts TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_phone_events_wxid_ts ON phone_status_events(wx_id, ts);
   `);
+}
+
+// ============================================
+// 手机状态事件
+// ============================================
+export interface PhoneStatusEvent {
+  wxId: string;
+  name?: string;
+  fromState: "online" | "offline" | "unknown";
+  toState: "online" | "offline";
+  durationSec?: number;
+}
+
+export function recordPhoneStatusEvent(e: PhoneStatusEvent): void {
+  const db = getDb();
+  db.prepare(
+    "INSERT INTO phone_status_events (wx_id, name, from_state, to_state, duration_sec) VALUES (?, ?, ?, ?, ?)",
+  ).run(e.wxId, e.name ?? null, e.fromState, e.toState, e.durationSec ?? null);
+}
+
+export function listPhoneStatusEvents(wxId?: string, limit = 50): any[] {
+  const db = getDb();
+  return wxId
+    ? db.prepare("SELECT * FROM phone_status_events WHERE wx_id=? ORDER BY id DESC LIMIT ?").all(wxId, limit)
+    : db.prepare("SELECT * FROM phone_status_events ORDER BY id DESC LIMIT ?").all(limit);
 }
 
 // ============================================

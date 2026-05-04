@@ -214,6 +214,105 @@ const TOOLS = [
     },
     runArgs: (a: any) => ["phone", a.wxId],
   },
+  {
+    name: "wework_get_contact",
+    description: "查某个客户/联系人的详细信息.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string" },
+        remoteId: { type: "string", description: "联系人 RemoteId" },
+      },
+      required: ["wxId", "remoteId"],
+    },
+    runArgs: (a: any) => ["contact", a.wxId, a.remoteId],
+  },
+  {
+    name: "wework_my_moments",
+    description: "拉取我自己发布的朋友圈列表.",
+    inputSchema: {
+      type: "object",
+      properties: { wxId: { type: "string" } },
+      required: ["wxId"],
+    },
+    runArgs: (a: any) => ["my-moments", a.wxId],
+  },
+  {
+    name: "wework_sync_data",
+    description: "触发数据同步 (通讯录/客户/会话/标签).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string" },
+        type: { type: "string", enum: ["contacts", "customers", "conversations", "labels", "all"], description: "同步类型" },
+      },
+      required: ["wxId", "type"],
+    },
+    runArgs: (a: any) => ["sync", a.wxId, a.type],
+  },
+  {
+    name: "wework_revoke_message",
+    description: "撤回消息 (仅限 2 分钟内自己发的).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string" },
+        msgId: { type: "string" },
+        convId: { type: "string" },
+      },
+      required: ["wxId", "msgId", "convId"],
+    },
+    runArgs: (a: any) => ["revoke", a.wxId, a.msgId, a.convId],
+  },
+  {
+    name: "wework_forward_message",
+    description: "转发某条消息到另一个会话.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string" },
+        msgId: { type: "string" },
+        fromConvId: { type: "string" },
+        toConvId: { type: "string" },
+      },
+      required: ["wxId", "msgId", "fromConvId", "toConvId"],
+    },
+    runArgs: (a: any) => ["forward", a.wxId, a.msgId, a.fromConvId, a.toConvId],
+  },
+  {
+    name: "wework_group_set_name",
+    description: "改群名 (针对自己是群主的群).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string" },
+        groupConvId: { type: "string" },
+        name: { type: "string" },
+      },
+      required: ["wxId", "groupConvId", "name"],
+    },
+    runArgs: (a: any) => ["group", a.wxId, "set_name", "--group", a.groupConvId, "--content", a.name],
+  },
+  {
+    name: "wework_group_add_member",
+    description: "拉成员进群.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string" },
+        groupConvId: { type: "string" },
+        members: { type: "array", items: { type: "string" }, description: "客户 RemoteId 列表" },
+      },
+      required: ["wxId", "groupConvId", "members"],
+    },
+    runArgs: (a: any) => ["group", a.wxId, "add_member", "--group", a.groupConvId, "--members", ...a.members],
+  },
+  {
+    name: "wework_health",
+    description: "综合健康检查 (服务/端口/Java/手机/swap/SQLite). 排查问题首选.",
+    inputSchema: { type: "object", properties: {} },
+    runArgs: (_a: any) => ["health", "--json"],
+  },
 ];
 
 const server = new Server(
