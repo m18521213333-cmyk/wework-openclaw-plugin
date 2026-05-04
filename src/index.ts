@@ -107,6 +107,12 @@ export default definePluginEntry({
     registerMomentsTools(api);
     registerDeviceTools(api);
 
+    // [2026-05-04 已知限制] OpenClaw 2026.5.x 改了 plugin 暴露 tool 给 agent 的规则,
+    // 要求 plugin 是 "capability mode" (注册 channel/provider/agent-harness 等). 我们目前
+    // 是 "non-capability" mode, 所以 36 个 wework_* tools 在 CLI 和 service 里都能用,
+    // 但 LLM agent (openclaw agent ...) 看不到它们. 解决路径需要重构 plugin 注册逻辑.
+    // 当前 workaround: 用户继续用 CLI (wework send/group/moments/...) 直接驱动.
+
     // 后台服务: WS 客户端连接 Java 后端
     api.registerService({
       id: "wework-ws-client",
