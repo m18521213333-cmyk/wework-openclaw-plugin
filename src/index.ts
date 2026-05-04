@@ -34,6 +34,8 @@ import {
 import { handleAiReply } from "./services/dify-service.js";
 import { checkKeywordReply, checkAutoAcceptFriend, persistMessage } from "./services/automation-engine.js";
 import { startScheduler, stopScheduler } from "./services/scheduler-service.js";
+import { startPhoneMonitor, stopPhoneMonitor } from "./services/phone-monitor.js";
+import { listPhoneStatusEvents } from "./services/storage-service.js";
 
 // send-helper (CLI 直接调用)
 import {
@@ -80,14 +82,6 @@ export default definePluginEntry({
   register(api: OpenClawPluginApi) {
     const logger = api.logger;
 
-    // 仅在 systemd openclaw-scrm.service 中启动 (Environment=WEWORK_PLUGIN_ENABLE=1).
-    // 其他 openclaw 进程 (默认 gateway / 手动 ssh / cron 等) 加载插件时直接 noop,
-    // 避免多个 openclaw 同时用 pluginbot 登录 Java 后端互相 squeeze.
-    if (process.env.WEWORK_PLUGIN_ENABLE !== "1") {
-      logger.info("[wework-scrm] 跳过加载 (没有 WEWORK_PLUGIN_ENABLE=1)");
-      return;
-    }
-
     // OpenClaw SDK 的 api.config 是整个 ~/.openclaw/openclaw.json 的内容,
     // 插件自己的 config 在 plugins.entries["wework-scrm"].config 里, 要手动取
     const wholeCfg = (api.config ?? {}) as Record<string, any>;
@@ -100,7 +94,8 @@ export default definePluginEntry({
       dify: { ...DEFAULT_CONFIG.dify, ...(pluginCfg.dify ?? {}) },
     };
 
-    // 注册全部 Agent 工具 (36个)
+    // 注册全部 Agent 工具 (36个) — 始终注册, 让 OpenClaw inspect/agent 都能看到 tools
+    // (避免之前 "WEWORK_PLUGIN_ENABLE 没设就 return" 导致 tool 不可见的问题)
     registerMessageTools(api);
     registerContactTools(api);
     registerGroupTools(api);
@@ -118,6 +113,14 @@ export default definePluginEntry({
       id: "wework-ws-client",
 
       async start() {
+        // WS 连接只能由 systemd-managed openclaw-scrm.service 持有 (避免多进程
+        // 同账号 squeeze). 其他 openclaw 进程 (CLI / agent / inspect) 加载
+        // plugin 时跳过 WS, 但 tools 正常注册可见.
+        if (process.env.WEWORK_PLUGIN_ENABLE !== "1") {
+          logger.info("[wework-scrm] tools 已注册, 但跳过 WS 连接 (没 WEWORK_PLUGIN_ENABLE=1)");
+          return;
+        }
+
         // 初始化 SQLite
         getDb(cfg.storage.sqlitePath);
         logger.info(`[Storage] SQLite: ${cfg.storage.sqlitePath}`);
@@ -256,12 +259,16 @@ export default definePluginEntry({
         // 启动定时任务调度
         startScheduler(logger);
 
+        // 启动手机 SDK 在线状态监控 (60s 轮询 MySQL, 状态变化时落库 + 告警)
+        startPhoneMonitor(logger, 60_000);
+
         // 连接
         await client.start();
       },
 
       async stop() {
         stopScheduler();
+        stopPhoneMonitor();
         const c = getWeWorkClient();
         if (c) await c.stop();
         closeDb();
@@ -343,11 +350,203 @@ export default definePluginEntry({
       }
 
       // --- 状态 ---
-      ww.command("status").description("查看连接状态").action(withConnection(async () => {
-        const c = getWeWorkClient();
-        if (!c) { console.log("❌ 插件未启动"); return; }
-        console.log(`Java 后端: ${c.connected ? "✅ 已连接" : "❌ 未连接"} (${cfg.javaWsUrl})`);
-      }));
+      // 综合健康检查: WS 连接 + 手机 SDK isonline + 系统资源
+      // 加 --json 给 MCP server / 自动化 用
+      ww.command("status")
+        .description("查 WS 连接 + 手机在线 + 系统综合状态")
+        .option("--json", "JSON 输出 (给程序读)")
+        .option("--wx-id <id>", "查指定 wxId 的手机状态, 默认所有")
+        .action(withConnection(async (opts: { json?: boolean; wxId?: string }) => {
+          const c = getWeWorkClient();
+          const wsConnected = c?.connected ?? false;
+          const result: any = {
+            ts: new Date().toISOString(),
+            ws: { connected: wsConnected, url: cfg.javaWsUrl },
+            phones: [] as Array<{ wxId: string; name: string; online: boolean }>,
+            warnings: [] as string[],
+          };
+
+          // 查 MySQL 看手机 SDK 在线状态 (isonline=0 表示真在线, 1=离线)
+          try {
+            const propsPath = "/opt/wework/wework-server/src/main/resources/application.properties";
+            if (fs.existsSync(propsPath)) {
+              const props = fs.readFileSync(propsPath, "utf8");
+              const dbUser = props.match(/^spring\.datasource\.username=(.+)$/m)?.[1]?.trim() ?? "wework";
+              const dbPass = props.match(/^spring\.datasource\.password=(.+)$/m)?.[1]?.trim() ?? "";
+              const dbName = props.match(/jdbc:mysql:\/\/[^/]+\/([^?]+)/)?.[1] ?? "workchat";
+              if (dbPass) {
+                const filter = opts.wxId ? `WHERE wxid=${opts.wxId}` : `WHERE wxid IS NOT NULL`;
+                const sql = `SELECT wxid, name, isonline FROM tbl_wx_accountinfo ${filter};`;
+                const { execFileSync } = await import("node:child_process");
+                const out = execFileSync("mysql", ["-u", dbUser, "-N", "-B", dbName, "-e", sql],
+                  { env: { ...process.env, MYSQL_PWD: dbPass }, encoding: "utf8", timeout: 5000 });
+                for (const line of out.trim().split("\n")) {
+                  const [wxId, name, isonlineStr] = line.split("\t");
+                  if (!wxId) continue;
+                  const online = isonlineStr === "0";
+                  result.phones.push({ wxId, name, online });
+                  if (!online) result.warnings.push(`手机 ${name}(${wxId}) SDK 离线 (isonline=${isonlineStr}) — 客户消息发不到!`);
+                }
+              }
+            }
+          } catch (e: any) {
+            result.warnings.push(`无法查 MySQL phone status: ${e.message}`);
+          }
+
+          if (!wsConnected) result.warnings.push("Java WS 未连接, 收发都会失败");
+
+          if (opts.json) {
+            console.log(JSON.stringify(result, null, 2));
+            return;
+          }
+
+          // 人类可读输出
+          console.log(`Java WS:    ${wsConnected ? "✅ 已连接" : "❌ 未连接"} (${cfg.javaWsUrl})`);
+          if (result.phones.length === 0) {
+            console.log("手机 SDK:   ⚠️  无数据 (查不到 tbl_wx_accountinfo)");
+          } else {
+            for (const p of result.phones) {
+              console.log(`手机 SDK:   ${p.online ? "✅ 在线" : "❌ 离线"} ${p.name}(${p.wxId})`);
+            }
+          }
+          if (result.warnings.length > 0) {
+            console.log("");
+            console.log("⚠️  警告:");
+            for (const w of result.warnings) console.log(`  - ${w}`);
+          }
+        }));
+
+      // --- 手机状态事件历史 ---
+      ww.command("events")
+        .description("查手机 SDK 在线/离线 状态变化历史")
+        .option("--wx-id <id>", "限定 wxId")
+        .option("-n, --limit <n>", "条数, 默认 20", "20")
+        .option("--json", "JSON 输出")
+        .action((opts: { wxId?: string; limit: string; json?: boolean }) => {
+          const limit = parseInt(opts.limit, 10) || 20;
+          const events = listPhoneStatusEvents(opts.wxId, limit);
+          if (opts.json) { console.log(JSON.stringify(events, null, 2)); return; }
+          if (events.length === 0) {
+            console.log("暂无手机状态事件 (PhoneMonitor 还在初始化, 或者状态没变化过)");
+            return;
+          }
+          console.log("手机 SDK 在线/离线 历史 (最新在前):");
+          for (const e of events as any[]) {
+            const icon = e.to_state === "offline" ? "❌" : "✅";
+            const dur = e.duration_sec ? ` (上一状态持续 ${e.duration_sec}s)` : "";
+            console.log(`  ${e.ts}  ${icon} ${e.name}(${e.wx_id}) ${e.from_state} → ${e.to_state}${dur}`);
+          }
+        });
+
+      // --- 综合健康检查 ---
+      // status 只看 WS+phone, health 把整套基础设施都查一遍 (运维一条命令搞定)
+      ww.command("health")
+        .description("综合健康检查 (Java/Redis/MySQL/手机/swap/服务全套)")
+        .option("--json", "JSON 输出")
+        .action(async (opts: { json?: boolean }) => {
+          const { execFile } = await import("node:child_process");
+          const { promisify } = await import("node:util");
+          const exec = promisify(execFile);
+          const sh = async (cmd: string, args: string[], timeout = 5000) => {
+            try { const r = await exec(cmd, args, { encoding: "utf8", timeout }); return r.stdout.trim(); }
+            catch (e: any) { return null; }
+          };
+          const probe: any = { ts: new Date().toISOString(), checks: {} };
+
+          // 1. systemd 服务
+          for (const svc of ["openclaw-scrm", "wework-server", "nginx", "mysql", "redis-server"]) {
+            const r = await sh("systemctl", ["is-active", `${svc}.service`]);
+            probe.checks[`svc:${svc}`] = { ok: r === "active", value: r };
+          }
+
+          // 2. Java 端口
+          for (const port of ["15086", "15087", "15088"]) {
+            const r = await sh("ss", ["-tln"]);
+            const listening = r?.includes(`:${port} `) ?? false;
+            probe.checks[`port:${port}`] = { ok: listening };
+          }
+
+          // 3. 内存 / swap / load
+          const free = await sh("free", ["-m"]);
+          if (free) {
+            const memLine = free.split("\n").find((l) => l.startsWith("Mem:"));
+            const swapLine = free.split("\n").find((l) => l.startsWith("Swap:"));
+            const memCols = memLine?.split(/\s+/) ?? [];
+            const swapCols = swapLine?.split(/\s+/) ?? [];
+            const memAvail = parseInt(memCols[6] ?? "0", 10);
+            const swapTotal = parseInt(swapCols[1] ?? "0", 10);
+            probe.checks["memory:available_mb"] = { ok: memAvail > 200, value: memAvail };
+            probe.checks["swap:total_mb"] = { ok: swapTotal > 0, value: swapTotal, hint: swapTotal === 0 ? "没 swap, RAM 紧时 SSH 会卡 banner timeout" : "" };
+          }
+          const upt = await sh("uptime", []);
+          probe.checks["uptime"] = { ok: true, value: upt };
+
+          // 4. WS 状态: 看 systemd service 进程的 PID 是否真连着 Java 15088
+          // (CLI 自己的 WS 是临时的, 不代表真实运行状态)
+          try {
+            const sysctlPid = await sh("systemctl", ["show", "-p", "MainPID", "openclaw-scrm.service", "--value"]);
+            const pid = sysctlPid?.trim();
+            if (pid && pid !== "0") {
+              const ssOut = await sh("ss", ["-tn"]);
+              const wsConnected = ssOut?.split("\n").some((l) =>
+                l.includes(":15088") && l.includes("ESTAB")) ?? false;
+              probe.checks["service:ws_connected"] = { ok: wsConnected,
+                value: wsConnected ? `service PID ${pid} 连着 Java 15088` : "service WS 没连上 Java" };
+            } else {
+              probe.checks["service:ws_connected"] = { ok: false, value: "service 进程没在跑" };
+            }
+          } catch (e: any) { /* 忽略 */ }
+
+          // 5. 手机 SDK isonline (从 MySQL)
+          try {
+            const propsPath = "/opt/wework/wework-server/src/main/resources/application.properties";
+            if (fs.existsSync(propsPath)) {
+              const props = fs.readFileSync(propsPath, "utf8");
+              const dbUser = props.match(/^spring\.datasource\.username=(.+)$/m)?.[1]?.trim() ?? "wework";
+              const dbPass = props.match(/^spring\.datasource\.password=(.+)$/m)?.[1]?.trim() ?? "";
+              const dbName = props.match(/jdbc:mysql:\/\/[^/]+\/([^?]+)/)?.[1] ?? "workchat";
+              if (dbPass) {
+                const out = await sh("mysql", ["-u", dbUser, "-N", "-B", dbName, "-e",
+                  "SELECT wxid, name, isonline FROM tbl_wx_accountinfo WHERE wxid IS NOT NULL;"]);
+                if (out) {
+                  const phones = out.split("\n").filter(Boolean).map((l) => {
+                    const [wxid, name, isonline] = l.split("\t");
+                    return { wxid, name, online: isonline === "0" };
+                  });
+                  probe.checks["phone:online_count"] = { ok: phones.some((p) => p.online), value: phones };
+                }
+              }
+            }
+          } catch (e: any) { /* 忽略 */ }
+
+          // 6. nginx /attachment 反代
+          const nginxOk = await sh("curl", ["-sS", "-m", "3", "-o", "/dev/null", "-w", "%{http_code}",
+            "http://127.0.0.1/attachment/"]);
+          probe.checks["nginx:attachment"] = { ok: nginxOk === "200" || nginxOk === "403", value: nginxOk };
+
+          // 7. SQLite 大小
+          if (fs.existsSync(cfg.storage.sqlitePath)) {
+            const stat = fs.statSync(cfg.storage.sqlitePath);
+            probe.checks["sqlite:size_kb"] = { ok: true, value: Math.round(stat.size / 1024) };
+          }
+
+          // ====== 输出 ======
+          const failed = Object.entries(probe.checks).filter(([_, v]: any) => !v.ok);
+          probe.summary = { total: Object.keys(probe.checks).length, failed: failed.length };
+
+          if (opts.json) { console.log(JSON.stringify(probe, null, 2)); return; }
+          console.log("=== WeWork SCRM 综合健康检查 ===");
+          for (const [k, v] of Object.entries(probe.checks)) {
+            const vv = v as any;
+            const icon = vv.ok ? "✅" : "❌";
+            const valStr = typeof vv.value === "string" ? vv.value :
+              Array.isArray(vv.value) ? vv.value.map((p: any) => `${p.name}(${p.online ? "在线" : "❌离线"})`).join(", ") :
+              String(vv.value ?? "");
+            console.log(`  ${icon} ${k.padEnd(28)} ${valStr}${vv.hint ? "  ← " + vv.hint : ""}`);
+          }
+          console.log("");
+          console.log(`Summary: ${failed.length === 0 ? "✅ 全绿" : `❌ ${failed.length}/${probe.summary.total} 项异常`}`);
+        });
 
       // --- 发消息 ---
       ww.command("send")

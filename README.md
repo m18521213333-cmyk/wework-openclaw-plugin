@@ -2,7 +2,23 @@
 
 企业微信 SCRM 管理插件 for OpenClaw
 
-通过 WebSocket 协议把企业微信功能（消息收发、客户管理、群聊、朋友圈、自动化）暴露成 OpenClaw 的 36 个 agent tools + 14 个 CLI 命令。最终形态：**OpenClaw Agent 用自然语言驱动企业微信操作**。
+通过 WebSocket 协议把企业微信功能（消息收发、客户管理、群聊、朋友圈、自动化）暴露成 OpenClaw 的 36 个 agent tools + 14 个 CLI 命令 + MCP server。**最终形态: OpenClaw Agent 用自然语言驱动企业微信操作 — 已打通**。
+
+## LLM Agent 自然语言驱动 (推荐入口)
+
+```bash
+openclaw agent -m "给孟伟@智简会员AI&CRM 发条消息: 周末愉快"
+# Kimi LLM 选 wework__wework_send_message tool
+# → MCP server spawn `wework send <wxId> <convId> "周末愉快"`
+# → Java 后端 → 手机 SDK → 客户企微 ✅
+```
+
+**架构**: 因为 OpenClaw 2026.5.x 的 agent 只看固定内置 tool 列表 (plugin 注册的 tool 不直接暴露), 我们用 **MCP server** 桥接 — `src/mcp-server.ts` 把 9 个 wework CLI 命令 (send/send-image/mass-send/moments/group/history/search/status/phone) 包成 MCP tool 暴露给 agent. agent 通过 MCP 协议自动发现并调用.
+
+**部署**:
+```bash
+openclaw mcp set wework '{"command":"node","args":["/root/.openclaw/extensions/wework-scrm/dist/mcp-server.js"]}'
+```
 
 ## 架构
 
