@@ -157,11 +157,21 @@ fi
 section "6. CLI 查询类命令"
 
 # 用一个临时文件做 CLI 输出捕获
+# 区分三种失败:
+#   - timeout (exit 124)              → 命令挂死, 通常是 Java 后端不通 / sshd 卡 / 进程互踢
+#   - 输出 0 字节但 exit 0            → CLI 注册没生效或被 openclaw 吞了 (检查 WEWORK_PLUGIN_ENABLE)
+#   - 有输出但没匹配上成功关键词       → 命令跑了但报错
 TMPLOG=$(mktemp)
 run_cli() {
   local desc="$1"; shift
   timeout 60 wework "$@" > "$TMPLOG" 2>&1
-  if grep -qE "✅|已发送|已连接|查询" "$TMPLOG"; then
+  local ec=$?
+  local sz=$(wc -c < "$TMPLOG")
+  if [ $ec -eq 124 ]; then
+    fail "$desc — 命令挂死 60s timeout (exit 124). 看 \`journalctl -u openclaw-scrm.service\` 或 \`ps -ef|grep openclaw\`"
+  elif [ "$sz" -eq 0 ]; then
+    fail "$desc — 0 字节输出 (exit $ec). CLI 注册没生效? 检查 WEWORK_PLUGIN_ENABLE=1"
+  elif grep -qE "✅|已发送|已连接|查询" "$TMPLOG"; then
     pass "$desc"
   else
     fail "$desc — 输出: $(tail -2 "$TMPLOG")"
