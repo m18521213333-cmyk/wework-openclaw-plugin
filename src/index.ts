@@ -36,6 +36,9 @@ import { checkKeywordReply, checkAutoAcceptFriend, persistMessage } from "./serv
 import { startScheduler, stopScheduler } from "./services/scheduler-service.js";
 import { startPhoneMonitor, stopPhoneMonitor } from "./services/phone-monitor.js";
 import { startContactSync, stopContactSync, handleContactPush, getLastSyncTime } from "./services/contact-sync.js";
+import { startAgentBackend } from "./services/agent-backend.js";
+import type { LLMProviderConfig } from "./services/llm-provider.js";
+import type { Server as HttpServer } from "node:http";
 import { handleAiCommand } from "./services/ai-command.js";
 import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getResolvedMediaStatus, clearResolvedMediaRecord, isTransientResolveError, getMessageMeta } from "./services/storage-service.js";
 
@@ -88,6 +91,9 @@ export default definePluginEntry({
 
   register(api: OpenClawPluginApi) {
     const logger = api.logger;
+
+    // Agent backend HTTP server handle (Express, 给 web v2 /api/agent/* 用)
+    let agentHttpServer: HttpServer | null = null;
 
     // OpenClaw SDK 的 api.config 是整个 ~/.openclaw/openclaw.json 的内容,
     // 插件自己的 config 在 plugins.entries["wework-scrm"].config 里, 要手动取
@@ -342,6 +348,35 @@ export default definePluginEntry({
           startContactSync(syncWxId, logger, 30 * 60 * 1000, 30_000);
         }
 
+        // 启动 agent HTTP backend (Express on :17800) — 给新 web /web2/ 用
+        // 提供 /api/agent/chat (SSE) + /api/agent/confirm + /api/llm/providers
+        try {
+          const llmCfg = (cfg as any).llm ?? {};
+          const apiKey =
+            process.env.MOONSHOT_API_KEY ||
+            process.env.KIMI_API_KEY ||
+            process.env.OPENAI_API_KEY ||
+            llmCfg.apiKey ||
+            "";
+          let defaultProvider: LLMProviderConfig | null = null;
+          if (apiKey) {
+            defaultProvider = {
+              id: "kimi-default",
+              type: "openai_compatible",
+              name: llmCfg.name || "Kimi",
+              baseUrl: llmCfg.baseUrl || "https://api.moonshot.cn/v1",
+              apiKey,
+              model: llmCfg.model || "kimi-k2-turbo-preview",
+            };
+            logger.info(`[agent-backend] LLM 配置: ${defaultProvider.name} ${defaultProvider.model}`);
+          } else {
+            logger.warn("[agent-backend] 未找到 LLM api key (env MOONSHOT_API_KEY/KIMI_API_KEY/OPENAI_API_KEY 或 plugin config llm.apiKey), agent chat 接口会返 503");
+          }
+          agentHttpServer = startAgentBackend({ defaultProvider, logger });
+        } catch (e: any) {
+          logger.error(`[agent-backend] 启动失败: ${e?.message ?? e}`);
+        }
+
         // 连接
         await client.start();
       },
@@ -350,6 +385,10 @@ export default definePluginEntry({
         stopScheduler();
         stopPhoneMonitor();
         stopContactSync();
+        if (agentHttpServer) {
+          await new Promise<void>((r) => agentHttpServer!.close(() => r()));
+          agentHttpServer = null;
+        }
         const c = getWeWorkClient();
         if (c) await c.stop();
         closeDb();
