@@ -237,6 +237,8 @@ export function getRecentMediaFromSender(wxId: string, senderId: string, withinM
   return rows.map((r) => {
     let url = "";
     let thumbUrl = "";
+    let isHd = false;
+    let sizeBytes = 0;
     // content 一般是 base64-encoded JSON (Java 推送时这么编)
     // 先尝试 base64 decode 再 parse, 失败再 fallback 原始
     const tryParse = (s: string): any | null => {
@@ -251,6 +253,8 @@ export function getRecentMediaFromSender(wxId: string, senderId: string, withinM
     if (obj) {
       url = obj.url || obj.fileUrl || "";
       thumbUrl = obj.thumbUrl || obj.coverUrl || "";
+      isHd = !!obj.isHd;
+      sizeBytes = Number(obj.size) || 0;
     }
 
     // [Java 后端 bug 兜底] Voice 类型 Java 报的 URL 后缀是 .mp3,
@@ -282,21 +286,36 @@ export function getRecentMediaFromSender(wxId: string, senderId: string, withinM
     const isOutgoing = String(r.is_send) === "true";
 
     // forwardable=false 的具体原因区分 (LLM 拿到能选对策略, 不要无脑试 resolve 浪费 60s)
-    // 实测 5/5 + 看 Java/Web 前端源码: SDK 对 Picture 类型 DownloadFileByMsgId 经常返回
-    //   success=true 但 Url=""  (Web 前端处理: 弹"资源地址获取失败" 警告 — SDK 协议固有限制).
-    // 所以 Picture 类型几乎永远 resolve_media 失败. 别让 LLM 浪费时间试.
-    // Voice/Video/File 反而更可能成功 (实测今天 09:33 video 转赵丽 OK).
+    // 5/5 终极调查后真相 — Picture 何时 forwardable=true vs false:
+    //   isHd=false 且 size <= ~700KB → Java/SDK 自动存图床, URL 是公网, forwardable=true
+    //   isHd=true (HD 原图)          → 不自动存, URL 是 /storage/emulated/...
+    //   isHd=false 但 size >= ~1MB   → 不自动存 (大图阈值)
+    //
+    // 这是企微/SDK 厂商的产品行为. 一旦没自动存, resolve_media 也几乎不能补救
+    // (Web 前端遇到同样情况只能弹"资源地址获取失败").
+    //
+    // 用户视角看不到 isHd 标志 (企微 App 里"原图"按钮控制), 操作"一样"但结果不同.
+    // 所以 LLM 必须**明确告诉用户原因和可执行方案** — 不是模糊的"SDK 限制".
     const isPicture = r.content_type === "Picture" || r.content_type === "2";
 
     let reason: string | undefined;
     if (!forwardable) {
       if (isOutgoing) {
         // 工作手机自己发出去的媒体, SDK 协议不支持重新上传 (官方限制).
-        reason = "outgoing 自己发出去的媒体, 工作手机 SDK 不支持重传到图床. **直接告诉用户在企微 App 里长按图片→转发**, 不要试 resolve_media (注定失败浪费 30s+).";
+        reason = "outgoing 自己发出去的媒体, SDK 不支持重传. **告诉用户在企微 App 里长按→转发**.";
       } else if (isPicture) {
-        // SDK 对 Picture 的 DownloadFileByMsgId 几乎不响应 (实测 5/5 + Web 前端代码自承认).
-        // 不要试, 直接给用户两个能 work 的方案.
-        reason = "incoming Picture 类型. 工作手机 SDK 协议对图片 DownloadFileByMsgId 不可靠 (经常返 success=true 但 Url='', 跟 Web 前端遇到一样, 那边就弹'资源地址获取失败'). **不要试 resolve_media**. 给用户两个方案: ①企微 App 长按图→转发 (5 秒); ②如果你想要 LLM 帮发同一张图, 让用户把图发到电脑/网盘, 然后 /ai 上传一张 [URL] 发给XX (走 wework_upload 路径).";
+        // 给用户精确的可执行诊断
+        const sizeKB = Math.round(sizeBytes / 1024);
+        const sizeDesc = sizeBytes > 1024 * 1024
+          ? `${(sizeBytes / 1024 / 1024).toFixed(2)}MB`
+          : `${sizeKB}KB`;
+        if (isHd) {
+          reason = `这张图你发的时候勾选了"原图"(isHd=true, ${sizeDesc}), 工作手机 SDK 协议不会把原图自动存图床, resolve_media 也几乎补不上 (Web 前端遇到一样, 那边就弹'资源地址获取失败'). **告诉用户两个方案**: ①企微 App 重发时**不要点"原图"按钮**, 发普通图我能直接转; ②或者长按图→手动转发给目标人. 千万别试 resolve_media (浪费 30s).`;
+        } else if (sizeBytes > 800 * 1024) {
+          reason = `这张图 size=${sizeDesc} 超过 SDK 自动入图床阈值 (~800KB), 没自动公网化. **告诉用户两个方案**: ①企微 App 重发时压缩一下图 (尺寸小一些, ≤700KB 我能直接转); ②或者长按图→手动转发. 别试 resolve_media.`;
+        } else {
+          reason = `这张图 isHd=false size=${sizeDesc}, 按理应该自动入图床但没入 (Java/SDK 偶发故障). 可以试 wework_resolve_media; 失败就让用户手动转发.`;
+        }
       } else if (!url) {
         // 非 Picture (Voice/Video/File) 且 url 完全空
         reason = "incoming 大文件未自动入图床. 用 wework_resolve_media(msgId) 触发手机 SDK 上传, 拿到 URL 再 send_media_url. 失败 (其他任务下载中=Java 繁忙→已自动重试) 退回手动转发.";
@@ -313,6 +332,8 @@ export function getRecentMediaFromSender(wxId: string, senderId: string, withinM
       ts: r.ts,
       msgId: r.msg_id,
       isOutgoing,
+      isHd,
+      sizeBytes,
       forwardable,
       reason,
       thumbUrlForwardable: !!thumbUrl && /^https?:\/\//.test(thumbUrl),

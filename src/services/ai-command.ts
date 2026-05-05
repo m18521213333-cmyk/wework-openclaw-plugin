@@ -117,20 +117,21 @@ export function handleAiCommand(ctx: CmdContext): boolean {
 
 媒体发送工作流 (用户说"把刚发的 X 个媒体发给YY, 加文字Y"):
 1. wework__wework_recent_media(wxId, senderId=${ctx.senderId}, limit=N) 拿 URL 列表
-   每条返回: contentType, url, msgId, forwardable, isOutgoing, thumbUrl, reason
+   每条返回: contentType, url, msgId, forwardable, isOutgoing, isHd, sizeBytes, thumbUrl, reason
 2. wework__wework_find_contact 找 YY 的 convId
 3. 先 wework__wework_send_message(wxId, convId, message=Y) 发文字
-4. 对每个媒体, 看 forwardable + isOutgoing + contentType 字段决策:
+4. 对每个媒体, 看 forwardable + isOutgoing + contentType + isHd + sizeBytes 字段决策:
 
    a. forwardable=true: wework_send_media_url(wxId, convId, url, mediaType) 真发出去
       mediaType: Picture→image, Voice→voice, Video→video, File→file
 
-   b. forwardable=false 且 contentType=Picture (无论 isOutgoing):
-      → **不要调 resolve_media** (SDK 协议对 Picture DownloadFileByMsgId 极不可靠,
-         实测 + Web 前端源码都承认这点 — Web 端弹"资源地址获取失败"也是这个原因)
-      → 直接 1 句话告诉用户:
-        "图片 SDK 协议限制不能自动转发, 你企微 App 里长按图→转发给YY 更快; 或者把图发到电脑后让我用 /ai 上传发"
-      → 不要写长解释, 不要列原因表, 用户只想知道"怎么办"
+   b. forwardable=false 且 contentType=Picture:
+      → **绝对不调 resolve_media** (SDK 协议对图片 DownloadFileByMsgId 极不可靠)
+      → reason 字段已经包含精确根因 (isHd / size 超阈值), 直接告诉用户:
+        * 如果 isHd=true → "你这张图发的时候勾了'原图', 工作手机 SDK 协议不能转原图. 重发时不勾原图我就能直接转, 或者你企微长按图→转发也行"
+        * 如果 sizeBytes > 800KB → "图太大 (size=XXMB), SDK 没自动入图床. 重发时压缩小一点 (≤700KB) 我能直接转, 或者长按手动转发"
+        * 否则 → 试 resolve_media, 失败再建议手动
+      → **必须告诉用户具体的'重发时怎么做'**, 不要只说"SDK 限制" — 用户没法行动
 
    c. forwardable=false 且 isOutgoing=true 且不是 Picture (Voice/Video/File):
       → **直接放弃 resolve_media** (outgoing 不能重传)
@@ -147,6 +148,10 @@ export function handleAiCommand(ctx: CmdContext): boolean {
 - 对 Picture 类型试 wework_resolve_media (SDK 几乎必失败, 浪费 30s+ 用户等得心烦)
 - 对 isOutgoing=true 的媒体试 wework_resolve_media (同上)
 - 媒体的 url 字段是 /storage/emulated/... 手机本地路径不是公网, 永远不能直接 send
+- 模糊地说"SDK 限制不能转" — 必须给出**用户能立即操作的方案**:
+  * "重发时不要勾选原图" (isHd=true 场景)
+  * "重发时压缩图 ≤700KB" (大图场景)
+  * "长按图→转发给YY" (兜底场景)
 - 失败时长篇解释技术原因. 用户只想知道两件事: "成功还是失败" + "失败的话我现在能干啥"
 
 回复格式要求:
