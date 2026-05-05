@@ -40,13 +40,17 @@ import { handleAiCommand } from "./services/ai-command.js";
 import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getMessageMeta } from "./services/storage-service.js";
 
 // send-helper (CLI 直接调用)
+// 子进程模式下 Java pluginbot-cli 经常被互踢, 所有 send 路径都走 withRetry 版.
+// sync 版 (sendMessage/forwardMessage/...) 留给后台 service 进程的事件回调用 — 那边 WS 长连接稳定.
 import {
-  sendMessage, revokeMessage, forwardMessage,
   searchMessages, triggerHistoryMessages,
   getContactInfo, triggerSync, phoneState,
-  chatRoomAction, massSend, postMoments, pullMySns,
+  pullMySns,
   waitTaskResult,
-  downloadByMsgId,
+  sendMessageWithRetry, forwardMessageWithRetry,
+  massSendWithRetry, postMomentsWithRetry,
+  chatRoomActionWithRetry, downloadByMsgIdWithRetry,
+  revokeMessageWithRetry,
 } from "./services/send-helper.js";
 
 // node 内置: HTTP 上传 (wework upload 用)
@@ -288,8 +292,8 @@ export default definePluginEntry({
                       // 延迟 ~30 秒等客户确认.
                       const delayMs = payload.delayMs ?? 30000;
                       logger.info(`[PendingTask] ⏳ 延迟 ${delayMs}ms 后发欢迎到 RemoteId=${realConvId} (等客户确认加群)`);
-                      setTimeout(() => {
-                        const r = sendMessage(
+                      setTimeout(async () => {
+                        const r = await sendMessageWithRetry(
                           pending.wxId,
                           String(realConvId),
                           payload.content,
@@ -535,7 +539,7 @@ export default definePluginEntry({
           }
           const msgRemoteId = meta.msg_remote_id ?? "";
           // 2. 触发下载 (含 MsgRemoteId + FileType, 否则手机 SDK 不响应)
-          const trig = downloadByMsgId(wxId, msgId, String(msgRemoteId), fileType);
+          const trig = await downloadByMsgIdWithRetry(wxId, msgId, String(msgRemoteId), fileType);
           if (!trig.success) {
             console.log(opts.json ? JSON.stringify({ ok: false, error: trig.error }) : `❌ 触发下载失败: ${trig.error}`);
             return;
@@ -775,6 +779,8 @@ export default definePluginEntry({
         });
 
       // --- 发消息 ---
+      // 重要: 这条 CLI 是 MCP 工具 wework_send_message / wework_send_media_url / wework_send_image_url 的实际后端,
+      // LLM 一次 /ai 会快速 spawn 多个子进程, Java pluginbot-cli 单会话语义会互踢 → 必须走 retry 版.
       ww.command("send")
         .description("发送消息")
         .argument("<wxId>", "企业微信ID")
@@ -782,7 +788,12 @@ export default definePluginEntry({
         .argument("<message>", "消息内容")
         .option("-t, --type <type>", "消息类型: text/image/file/link", "text")
         .action(withConnection(async (wxId: string, convId: string, message: string, opts: { type: string }) => {
-          const r = sendMessage(wxId, convId, message, opts.type);
+          const r = await sendMessageWithRetry(wxId, convId, message, opts.type, undefined, {
+            attempts: 4, waitForConnectMs: 15000,
+            onAttempt: (n, info) => {
+              if (n > 1 || !info.connected) console.log(`[retry] 第 ${n} 次尝试 (connected=${info.connected}${info.lastError ? ", err=" + info.lastError : ""})`);
+            },
+          });
           console.log(r.success ? `✅ 消息已发送 → ${convId}` : `❌ ${r.error}`);
         }));
 
@@ -855,7 +866,7 @@ export default definePluginEntry({
           console.log(r.success ? `✅ 查询已发送: ${remoteId}` : `❌ ${r.error}`);
         }));
 
-      // --- 群发 ---
+      // --- 群发 --- (走重试: 同 send 命令理由)
       ww.command("mass-send")
         .description("群发消息")
         .argument("<wxId>", "企业微信ID")
@@ -864,7 +875,7 @@ export default definePluginEntry({
         .option("--to <ids...>", "目标会话ID列表")
         .action(withConnection(async (wxId: string, message: string, opts: { type: string; to: string[] }) => {
           if (!opts.to?.length) { console.log("❌ 请指定 --to <会话ID列表>"); return; }
-          const r = massSend(wxId, opts.to, message, opts.type);
+          const r = await massSendWithRetry(wxId, opts.to, message, opts.type);
           console.log(r.success ? `✅ 群发 → ${opts.to.length} 个会话` : `❌ ${r.error}`);
         }));
 
@@ -880,7 +891,7 @@ export default definePluginEntry({
         .option("--welcome-delay <ms>", "建群后延迟多久发欢迎 (等客户确认加群, 默认 30000ms)", "30000")
         .option("--wait-timeout <ms>", "等待 TaskResult 超时", "30000")
         .action(withConnection(async (wxId: string, action: string, opts: { group?: string; members?: string[]; content?: string; sendAfter?: string; welcomeDelay: string; waitTimeout: string }) => {
-          const r = chatRoomAction(wxId, action, opts.group, opts.members, opts.content);
+          const r = await chatRoomActionWithRetry(wxId, action, opts.group, opts.members, opts.content);
           if (!r.success) {
             console.log(`❌ ${r.error}`);
             return;
@@ -915,7 +926,7 @@ export default definePluginEntry({
         .option("-t, --type <type>", "类型: text/image/video/link", "text")
         .option("--media <urls...>", "图片/视频URL")
         .action(withConnection(async (wxId: string, content: string, opts: { type: string; media?: string[] }) => {
-          const r = postMoments(wxId, content, opts.type, opts.media);
+          const r = await postMomentsWithRetry(wxId, content, opts.type, opts.media);
           console.log(r.success ? "✅ 朋友圈发布指令已发送" : `❌ ${r.error}`);
         }));
 
@@ -954,7 +965,7 @@ export default definePluginEntry({
         .argument("<msgId>", "消息ID (从 history 拉到的 MsgId)")
         .argument("<convId>", "会话ID")
         .action(withConnection(async (wxId: string, msgId: string, convId: string) => {
-          const r = revokeMessage(wxId, msgId, convId);
+          const r = await revokeMessageWithRetry(wxId, msgId, convId);
           console.log(r.success ? `✅ 撤回指令已发送 (msg=${msgId})` : `❌ ${r.error}`);
         }));
 
@@ -966,7 +977,7 @@ export default definePluginEntry({
         .argument("<fromConvId>", "源会话ID")
         .argument("<toConvId>", "目标会话ID")
         .action(withConnection(async (wxId: string, msgId: string, fromConvId: string, toConvId: string) => {
-          const r = forwardMessage(wxId, msgId, fromConvId, toConvId);
+          const r = await forwardMessageWithRetry(wxId, msgId, fromConvId, toConvId);
           console.log(r.success ? `✅ 转发指令已发送 (${fromConvId} → ${toConvId})` : `❌ ${r.error}`);
         }));
 
@@ -1028,7 +1039,7 @@ export default definePluginEntry({
             return;
           }
           console.log(`✅ 上传完成: ${up.url}`);
-          const r = sendMessage(wxId, convId, up.url, "image");
+          const r = await sendMessageWithRetry(wxId, convId, up.url, "image");
           console.log(r.success ? `✅ 图片已发送 → ${convId}` : `❌ 发送失败: ${r.error}`);
         }));
 

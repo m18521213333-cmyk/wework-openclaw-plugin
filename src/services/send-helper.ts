@@ -31,6 +31,9 @@ export interface SendResult {
 /**
  * 通过 Java 后端 WS 发送指令
  * 对应原 PC 前端 WebSocket 发 JSON → WebSocketMessageProcessor 分发
+ *
+ * ⚠️ 同步快失败版: 不连接就返回. 历史路径 + 后台调度保留这个语义.
+ * 新代码请用 sendToJavaWithRetry — 会等重连 + 重试.
  */
 export function sendToJava(
   msgType: string,
@@ -49,6 +52,97 @@ export function sendToJava(
     return { success: false, error: "发送失败" };
   }
   return { success: true };
+}
+
+// ============================================
+// 异步重试版 sendToJava (主路径)
+// ============================================
+
+/** sendToJavaWithRetry 选项 */
+export interface SendRetryOpts {
+  /** 最多尝试次数 (含首次), 默认 4 */
+  attempts?: number;
+  /** 单次等待 client.connected 变 true 的最大时间 (ms), 默认 15000 */
+  waitForConnectMs?: number;
+  /** 重试间隔起始值 (ms), 默认 400. 实际间隔: 400 → 800 → 1600 → 3200 ms (指数退避) */
+  backoffStartMs?: number;
+  /** 想看每次尝试就传; 用 logger.info 之类 */
+  onAttempt?: (attempt: number, info: { connected: boolean; lastError?: string }) => void;
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * 等 WS 客户端 _connected 变 true (用于子进程刚启动 / 临时被踢后重连场景).
+ * 客户端自身有 5s 自动重连, 这里只是配合等待.
+ */
+async function waitForConnect(timeoutMs: number): Promise<boolean> {
+  const client = getWeWorkClient();
+  if (!client) return false;
+  if (client.connected) return true;
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (client.connected) return true;
+    await sleep(200);
+  }
+  return client.connected;
+}
+
+/**
+ * 通过 Java 后端 WS 发送指令, 失败自动重试.
+ *
+ * 重试策略:
+ *   1. 检查 client.connected. 如果断了, 等最多 waitForConnectMs (默认 15s) 让 WS 自动重连
+ *   2. 调 client.sendCommand. 成功就返回
+ *   3. 失败 (网络异常 / 被 Java 踢) 就 backoffStartMs * 2^(attempt-1) 退避后重试
+ *   4. 重试 attempts 次仍失败, 返回最后一次错误
+ *
+ * 触发场景:
+ *   - 多个 CLI 子进程同时 auth pluginbot-cli, Java 互相踢 → 短暂 1-2s _connected=false
+ *   - Java 后端重启 → 5-30s 不可用
+ *   - 凭据轮换时 plugin 重启 → ~10s 不可用
+ */
+export async function sendToJavaWithRetry(
+  msgType: string,
+  content: Record<string, unknown>,
+  opts: SendRetryOpts = {},
+): Promise<SendResult> {
+  const attempts = Math.max(1, opts.attempts ?? 4);
+  const waitForConnectMs = opts.waitForConnectMs ?? 15000;
+  const backoffStartMs = opts.backoffStartMs ?? 400;
+
+  const client = getWeWorkClient();
+  if (!client) {
+    return { success: false, error: "WS 客户端未初始化" };
+  }
+
+  let lastError = "";
+  for (let i = 1; i <= attempts; i++) {
+    // 等连接
+    const connected = await waitForConnect(waitForConnectMs);
+    opts.onAttempt?.(i, { connected, lastError: lastError || undefined });
+    if (!connected) {
+      lastError = `等待 Java 后端连接 ${waitForConnectMs / 1000}s 仍未恢复`;
+      // 后续 attempt 还会再等一次, 但最后一轮就直接退出
+      if (i === attempts) break;
+      await sleep(backoffStartMs * Math.pow(2, i - 1));
+      continue;
+    }
+
+    // 发
+    const ok = client.sendCommand(msgType, content);
+    if (ok) {
+      return { success: true };
+    }
+    lastError = `第 ${i}/${attempts} 次发送失败 (sendCommand 返回 false, 可能 ws 临时不可写)`;
+
+    // 退避
+    if (i < attempts) {
+      await sleep(backoffStartMs * Math.pow(2, i - 1));
+    }
+  }
+
+  return { success: false, error: `重试 ${attempts} 次仍失败: ${lastError}` };
 }
 
 // ============================================
@@ -74,10 +168,11 @@ function contentTypeValue(name: string): string {
 // 阶段 3: 消息
 // ============================================
 
-export function sendMessage(
+/** 构造 TalkToFriendTask payload (sendMessage / sendMessageWithRetry 共用) */
+function buildSendMessagePayload(
   wxId: string, convId: string, content: string,
-  contentType: string = "text", atList?: string[],
-): SendResult {
+  contentType: string, atList?: string[],
+): Record<string, unknown> {
   // 跟 web 前端 webSocketApi.js TalkToFriendTask 严格对齐:
   //   - WxId/ConvId/TaskId 用字符串 (int64 在 JSON 里官方推荐字符串, 避免 JS 精度丢失)
   //   - ContentType 用 enum 字符串名字 ("Text" 不是 0)
@@ -91,7 +186,27 @@ export function sendMessage(
     TaskId: String(Date.now()),
   };
   if (atList?.length) payload.AtSomeOne = atList.map(String);
-  return sendToJava("TalkToFriendTask", payload);
+  return payload;
+}
+
+export function sendMessage(
+  wxId: string, convId: string, content: string,
+  contentType: string = "text", atList?: string[],
+): SendResult {
+  return sendToJava("TalkToFriendTask", buildSendMessagePayload(wxId, convId, content, contentType, atList));
+}
+
+/** 异步重试版 sendMessage — 推荐主路径用这个 */
+export async function sendMessageWithRetry(
+  wxId: string, convId: string, content: string,
+  contentType: string = "text", atList?: string[],
+  opts?: SendRetryOpts,
+): Promise<SendResult> {
+  return sendToJavaWithRetry(
+    "TalkToFriendTask",
+    buildSendMessagePayload(wxId, convId, content, contentType, atList),
+    opts,
+  );
 }
 
 export function revokeMessage(wxId: string, msgId: string, convId: string): SendResult {
@@ -100,16 +215,34 @@ export function revokeMessage(wxId: string, msgId: string, convId: string): Send
   });
 }
 
+export async function revokeMessageWithRetry(wxId: string, msgId: string, convId: string, opts?: SendRetryOpts): Promise<SendResult> {
+  return sendToJavaWithRetry("MsgRevokeTask", {
+    WxId: String(wxId), MsgId: String(msgId), ConvId: String(convId),
+  }, opts);
+}
+
 export function forwardMessage(wxId: string, msgId: string, fromConvId: string, toConvId: string): SendResult {
   return sendToJava("ForwardMsgTask", {
     WxId: String(wxId), MsgId: String(msgId), ConvId: String(fromConvId), ToConvId: String(toConvId),
   });
 }
 
+export async function forwardMessageWithRetry(wxId: string, msgId: string, fromConvId: string, toConvId: string, opts?: SendRetryOpts): Promise<SendResult> {
+  return sendToJavaWithRetry("ForwardMsgTask", {
+    WxId: String(wxId), MsgId: String(msgId), ConvId: String(fromConvId), ToConvId: String(toConvId),
+  }, opts);
+}
+
 export function forwardMultiMessages(wxId: string, msgIds: string[], fromConvId: string, toConvId: string): SendResult {
   return sendToJava("ForwardMultiTask", {
     WxId: String(wxId), MsgIds: msgIds.map(String), ConvId: String(fromConvId), ToConvId: String(toConvId),
   });
+}
+
+export async function forwardMultiMessagesWithRetry(wxId: string, msgIds: string[], fromConvId: string, toConvId: string, opts?: SendRetryOpts): Promise<SendResult> {
+  return sendToJavaWithRetry("ForwardMultiTask", {
+    WxId: String(wxId), MsgIds: msgIds.map(String), ConvId: String(fromConvId), ToConvId: String(toConvId),
+  }, opts);
 }
 
 export function searchMessages(wxId: string, keyword: string, convId?: string): SendResult {
@@ -235,7 +368,8 @@ export async function waitTaskResult(
   });
 }
 
-export function chatRoomAction(wxId: string, action: string, convId?: string, members?: string[], content?: string, taskId?: number): SendResult {
+/** 群操作 action → proto enum 名 (RoomName/AddMember/...) */
+function buildChatRoomPayload(wxId: string, action: string, convId?: string, members?: string[], content?: string, taskId?: number): { payload: Record<string, unknown>; taskId: number } {
   // proto EnumChatRoomAction (string enum, 不是顺序编号):
   //   RoomName=0/改群名, ModifyPublicNoti=1/改公告, AddMember=2/拉人, KickMember=3/踢人,
   //   RoomShowName=4/改群内显示名, AddToPhonebook=5, NewMsgNoti=6, ExitRoom=7/退群,
@@ -263,7 +397,18 @@ export function chatRoomAction(wxId: string, action: string, convId?: string, me
   if (convId) p.ConvId = String(convId);
   if (members?.length) p.Members = members.map(String);
   if (content) p.Content = content;
-  const r = sendToJava("ChatRoomActionTask", p);
+  return { payload: p, taskId: tid };
+}
+
+export function chatRoomAction(wxId: string, action: string, convId?: string, members?: string[], content?: string, taskId?: number): SendResult {
+  const { payload, taskId: tid } = buildChatRoomPayload(wxId, action, convId, members, content, taskId);
+  const r = sendToJava("ChatRoomActionTask", payload);
+  return r.success ? { success: true, taskId: tid } as any : r;
+}
+
+export async function chatRoomActionWithRetry(wxId: string, action: string, convId?: string, members?: string[], content?: string, taskId?: number, opts?: SendRetryOpts): Promise<SendResult> {
+  const { payload, taskId: tid } = buildChatRoomPayload(wxId, action, convId, members, content, taskId);
+  const r = await sendToJavaWithRetry("ChatRoomActionTask", payload, opts);
   return r.success ? { success: true, taskId: tid } as any : r;
 }
 
@@ -309,11 +454,29 @@ export function massSend(wxId: string, convIds: string[], content: string, conte
   };
 }
 
+/** 异步重试版群发: 每条都各自走 sendMessageWithRetry, 单条失败不影响后续. */
+export async function massSendWithRetry(wxId: string, convIds: string[], content: string, contentType: string = "text", opts?: SendRetryOpts): Promise<SendResult> {
+  let okCount = 0;
+  let firstErr = "";
+  for (const convId of convIds) {
+    const r = await sendMessageWithRetry(wxId, convId, content, contentType, undefined, opts);
+    if (r.success) okCount++;
+    else if (!firstErr) firstErr = r.error ?? "unknown";
+  }
+  if (okCount === convIds.length) {
+    return { success: true };
+  }
+  return {
+    success: false,
+    error: `群发部分失败 (成功 ${okCount}/${convIds.length}): ${firstErr}`,
+  };
+}
+
 // ============================================
 // 阶段 6: 朋友圈
 // ============================================
 
-export function postMoments(wxId: string, content: string, contentType: string = "text", mediaUrls?: string[], linkUrl?: string, linkTitle?: string, visibleList?: string[]): SendResult {
+function buildPostMomentsPayload(wxId: string, content: string, contentType: string = "text", mediaUrls?: string[], linkUrl?: string, linkTitle?: string, visibleList?: string[]): Record<string, unknown> {
   // PostSnsTaskMessage proto 字段: WxId, Content(string), Media, Comment, Visible, TaskId, Poi
   // 注意: Content 是 string 类型 (不是 bytes), 不要 base64; 也没有 ContentType 字段.
   const p: Record<string, unknown> = {
@@ -332,7 +495,15 @@ export function postMoments(wxId: string, content: string, contentType: string =
   if (visibleList?.length) {
     p.Visible = { userIds: visibleList.map(String) };
   }
-  return sendToJava("PostSnsTask", p);
+  return p;
+}
+
+export function postMoments(wxId: string, content: string, contentType: string = "text", mediaUrls?: string[], linkUrl?: string, linkTitle?: string, visibleList?: string[]): SendResult {
+  return sendToJava("PostSnsTask", buildPostMomentsPayload(wxId, content, contentType, mediaUrls, linkUrl, linkTitle, visibleList));
+}
+
+export async function postMomentsWithRetry(wxId: string, content: string, contentType: string = "text", mediaUrls?: string[], linkUrl?: string, linkTitle?: string, visibleList?: string[], opts?: SendRetryOpts): Promise<SendResult> {
+  return sendToJavaWithRetry("PostSnsTask", buildPostMomentsPayload(wxId, content, contentType, mediaUrls, linkUrl, linkTitle, visibleList), opts);
 }
 
 export function postMomentsTask(wxId: string, taskId: string): SendResult {
@@ -399,6 +570,16 @@ export function downloadByMsgId(wxId: string, msgId: string, msgRemoteId?: strin
     FileType: fileType,
     TaskId: String(Date.now()),
   });
+}
+
+export async function downloadByMsgIdWithRetry(wxId: string, msgId: string, msgRemoteId?: string, fileType: number = 0, opts?: SendRetryOpts): Promise<SendResult> {
+  return sendToJavaWithRetry("DownloadFileByMsgIdTask", {
+    WxId: String(wxId),
+    MsgId: String(msgId),
+    MsgRemoteId: String(msgRemoteId ?? ""),
+    FileType: fileType,
+    TaskId: String(Date.now()),
+  }, opts);
 }
 
 export function triggerSync(wxId: string, dataType: string): SendResult {

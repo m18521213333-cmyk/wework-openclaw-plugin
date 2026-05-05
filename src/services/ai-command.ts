@@ -13,7 +13,7 @@
  */
 
 import { execFile } from "node:child_process";
-import { sendMessage } from "./send-helper.js";
+import { sendMessageWithRetry } from "./send-helper.js";
 
 const AI_PREFIX = "/ai";
 const AI_BIN = process.env.AI_BIN || "/usr/local/bin/openclaw";
@@ -88,14 +88,19 @@ export function handleAiCommand(ctx: CmdContext): boolean {
 
   const prompt = text.slice(AI_PREFIX.length).trim();
   if (!prompt) {
-    sendMessage(ctx.wxId, ctx.convId, "🤖 用法: /ai <你的自然语言指令>\n例: /ai 给客户余燕发条祝福: 周末愉快", "text");
+    // 用法提示走重试: 即使瞬时被踢也尽量送达
+    sendMessageWithRetry(ctx.wxId, ctx.convId, "🤖 用法: /ai <你的自然语言指令>\n例: /ai 给客户余燕发条祝福: 周末愉快", "text").catch((e) => {
+      ctx.logger.warn(`[AICmd] 用法提示发送失败: ${e?.message ?? e}`);
+    });
     return true;
   }
 
   ctx.logger.info(`[AICmd] 收到 /ai 指令 (convId=${ctx.convId}): ${prompt.slice(0, 60)}`);
 
-  // 立刻回执告诉用户在处理 (用户不会觉得没反应)
-  sendMessage(ctx.wxId, ctx.convId, `🤖 收到, 处理中…\n指令: ${prompt}`, "text");
+  // 立刻回执告诉用户在处理 (用户不会觉得没反应) — 走重试
+  sendMessageWithRetry(ctx.wxId, ctx.convId, `🤖 收到, 处理中…\n指令: ${prompt}`, "text").catch((e) => {
+    ctx.logger.warn(`[AICmd] 处理中提示发送失败: ${e?.message ?? e}`);
+  });
 
   // 异步跑 agent + 回复, 不阻塞 message handler
   // 注意 agent 跑完可能要 30-60 秒
@@ -134,15 +139,17 @@ export function handleAiCommand(ctx: CmdContext): boolean {
 - 不要展示 convId / remoteId / wxId 等技术 ID, 用联系人名字代替
 - 1-3 句话总结做了什么 + 是否成功, 别太长`;
 
-  runAgentAsync(enrichedPrompt).then((result) => {
+  runAgentAsync(enrichedPrompt).then(async (result) => {
     // result 可能很长, 截断到合理长度避免企微 1MB 限制
     const output = result.length > 4000 ? result.slice(0, 4000) + "\n…(截断)" : result;
     const reply = `✅ 已处理:\n\n${output}`;
-    sendMessage(ctx.wxId, ctx.convId, reply, "text");
-    ctx.logger.info(`[AICmd] ✓ 已回复结果 (长度 ${output.length})`);
-  }).catch((e: any) => {
+    // 结果回执是用户最关心的, 必须走重试 — 子进程序列后期 Java 经常被多个 auth 互踢
+    const r = await sendMessageWithRetry(ctx.wxId, ctx.convId, reply, "text", undefined, { attempts: 5, waitForConnectMs: 20000 });
+    if (r.success) ctx.logger.info(`[AICmd] ✓ 已回复结果 (长度 ${output.length})`);
+    else ctx.logger.error(`[AICmd] ❌ 回复结果发送失败 (重试已尽): ${r.error}`);
+  }).catch(async (e: any) => {
     const errMsg = e.message || String(e);
-    sendMessage(ctx.wxId, ctx.convId, `❌ 处理失败: ${errMsg.slice(0, 200)}`, "text");
+    await sendMessageWithRetry(ctx.wxId, ctx.convId, `❌ 处理失败: ${errMsg.slice(0, 200)}`, "text").catch(() => {});
     ctx.logger.error(`[AICmd] 失败: ${errMsg}`);
   });
 
