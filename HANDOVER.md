@@ -1,6 +1,6 @@
 # 🎁 wework-openclaw-plugin — 完整接手文档
 
-> 5/3 早 → 5/5 凌晨, ~25 小时, 24 个 commit, 全媒体闭环验证通过.
+> 5/3 早 → 5/5 上午, ~30 小时, 27 个 commit, 全媒体闭环验证通过, 凭据已轮换, send 路径有重试.
 > 任何新会话只看这份 30 秒能接上.
 
 ## ⭐ 终极形态 (今晚 5/5 凌晨实测落地)
@@ -63,6 +63,32 @@ LLM (Kimi via moonshot.cn) 自动:
 
 `/opt/wework/wework-server/` 已重新编译部署. 备份在 `/tmp/wework-patches/WebConfiguration.java.orig` 万一要回滚.
 
+## 已修的 P0 安全 (5/5 上午 09:35) — 强密码轮换
+
+5 个账号全部从弱密码 `1q2w3e4r5t` (键盘对角线模式, top100 字典里) 轮换成 24 位独立随机 alnum:
+- `tbl_accountinfo`: root / admin / pctest / pluginbot / pluginbot-cli (5 个账号)
+- `/root/.openclaw/openclaw.json` 同步 pluginbot + pluginbot-cli 两个机器人密码
+- 备份: `/root/.openclaw/openclaw.json.bak.*` + `/root/tbl_accountinfo.bak.*.sql`
+- 凭据归档: `/root/credentials.txt` (mode 600 仅 root 可读) — **抄一份到本地密码管理器**
+- 验证: 新密码 web 登录返回 token, 旧密码返回"账号或密码错误", health 全绿
+
+## 已修的 send 路径瞬时失败 (5/5 上午 10:30) — 重试机制
+
+**问题**: /ai 群发 N 联系人时, LLM 通过 mcp-server 快速 spawn 多个 `openclaw wework send` 子进程, 每个子进程都用 `pluginbot-cli` auth Java. **Java PC 协议默认一个账号一个活跃 WS 会话**, 后来的 auth 把先来的踢掉 → `_connected=false` → 立即返回"未连接 Java 后端" → LLM 看到错误反馈再自行重试, 体验差且漏发.
+
+**修复** (commit `2a0caeb`):
+- `send-helper.ts` 新增 `sendToJavaWithRetry` + 7 个 `*WithRetry` 包装函数
+  - 检测断开后等 WS 自动重连 (最长 15s, 客户端本身 5s 自动重连一次)
+  - 失败按指数退避重试 400→800→1600→3200ms, 最多 4 次
+  - /ai 最终结果回执用更激进的 attempts=5/waitForConnectMs=20s
+- 8 个 send 入口全切到 retry 版: `wework send` / `mass-send` / `forward` / `revoke` / `moments` / `group` / `send-image` / `PendingTask` 延迟欢迎
+- `ai-command.ts` 4 个 `sendMessage` 调用全切到 `sendMessageWithRetry`
+- 后台 service 进程 (WS 长连接稳的) 仍用同步快失败版
+
+**验证**: 5 个并发 CLI 子进程 5/5 全成功, 真实 /ai 群发 3 联系人文字+音频 61s 一次跑通, 三方均收到真音频, 无任何"未连接"日志.
+
+**根治** (待办, 大改): MCP 工具不要 spawn 子进程, 直接走主 service 的内置 RPC. 风险大, 先用 band-aid.
+
 ## 你要做的 3 件事 (按紧急度)
 
 ### 0. 关键命令一览
@@ -110,21 +136,18 @@ git remote set-url origin https://github.com/m18521213333-cmyk/wework-openclaw-p
 git push origin main             # 用户名输 m18521213333-cmyk, 密码输 PAT
 ```
 
-### 2. 轮换密码 (10 分钟, 重要!)
+### 2. 轮换密码 (✅ 5 个 web 账号已完成 5/5 上午; Redis/Dify/Kimi 待办)
 
-> ⚠️ 此前 commit 历史里有过明文密码 (5/3 凌晨调试时). 公开仓库后需要先轮换
-> 全部凭据再 push, 或者用 `git filter-repo` 清掉历史 (任选其一).
+> ⚠️ 此前 commit 历史里有过明文密码 (5/3 凌晨调试时). 公开仓库前需要先用
+> `git filter-repo` 清掉历史 (或者继续维持 private 仓库).
 
-需要换的全部凭据 — **真实值看你服务器上 application.properties / openclaw.json**, 这里只列怎么改:
-
-| 系统 | 在哪儿读 | 怎么换 |
-|---|---|---|
-| MySQL `wework` 用户 | `/opt/wework/wework-server/src/main/resources/application.properties` 里 `spring.datasource.password` | `mysql -uroot -p; SET PASSWORD FOR 'wework'@'localhost'=PASSWORD('新密码'); FLUSH PRIVILEGES;` 然后改 properties + 重启 wework-server |
-| Redis | application.properties 里 `spring.redis.password` | 改 redis conf + properties + 双重启 |
-| Dify Key | application.properties 里 `dify.key` | https://chat-dify.cloud.zjian.net/ 控制台 revoke + 重新生成 + 改 properties + 删 install.sh 里的硬编码 |
-| pctest web 账号 (pwd=`123456` 太弱) | MySQL `tbl_accountinfo` | `UPDATE tbl_accountinfo SET password='强密码' WHERE account='pctest';` |
-| pluginbot / pluginbot-cli | `~/.openclaw/openclaw.json` 里 `auth.password` / `auth.cliPassword` | 改 MySQL `tbl_accountinfo` 对应 password + 同步改 openclaw.json + restart openclaw-scrm |
-| Kimi API Key | `/etc/systemd/system/openclaw-scrm.service.d/llm-env.conf` 里 `KIMI_API_KEY` 等 | https://platform.moonshot.cn/console/api-keys revoke + 重新生成 + 改 systemd file + daemon-reload + restart |
+| 系统 | 状态 | 在哪儿读 | 怎么换 |
+|---|---|---|---|
+| `tbl_accountinfo` 5 个账号 (root/admin/pctest/pluginbot/pluginbot-cli) | ✅ **5/5 上午已轮换** 24 位 alnum 独立 | MySQL `workchat.tbl_accountinfo` | 见 `/root/credentials.txt` (600) |
+| MySQL `wework` 用户 | ⏳ 待轮换 | `application.properties` 里 `spring.datasource.password` | `mysql -uroot -p; SET PASSWORD FOR 'wework'@'localhost'='新密码';` 然后改 properties + 重启 wework-server |
+| Redis | ⏳ 待轮换 | application.properties 里 `spring.redis.password` | 改 redis conf + properties + 双重启 |
+| Dify Key | ⏳ 待轮换 | application.properties 里 `dify.key` | https://chat-dify.cloud.zjian.net/ 控制台 revoke + 重新生成 + 改 properties + 删 install.sh 里的硬编码 |
+| Kimi API Key | ⏳ 待轮换 | `/etc/systemd/system/openclaw-scrm.service.d/llm-env.conf` 里 `KIMI_API_KEY` | https://platform.moonshot.cn/console/api-keys revoke + 重新生成 + 改 systemd file + daemon-reload + restart |
 
 ### 3. 试试新群发 + 欢迎完整闭环
 
@@ -152,6 +175,9 @@ ssh wework-prod 'wework group 1688852285335663 create \
 
 | 时间 | bug | 修法 |
 |---|---|---|
+| **5/5 10:30** | LLM 群发 N 联系人时 send 路径瞬时失败 ("未连接 Java 后端") — 子进程 pluginbot-cli 互踢 | send-helper 加 `*WithRetry` 等重连+指数退避 (commit 2a0caeb) |
+| **5/5 09:35** | 5 个账号弱密码 `1q2w3e4r5t` (键盘对角线) | 24 位独立随机 alnum + openclaw.json 同步 |
+| **5/5 08:11** | Web /user/** 鉴权缺失 | WebConfiguration excludePathPatterns 改 /user/login |
 | 14:00 | 安全审计发现 dev-pipeline.ts 危险代码 (消息驱动 spawn child_process 跑 claude CLI) | 删除 |
 | 15:00 | Java 后端 OOM (TasksMax 4124 满了) | systemd override 改 16384 |
 | 16:00 | 阿里云 SG 不通 15087/15086 | 你在控制台开 |
@@ -188,7 +214,8 @@ wework-openclaw-plugin/
 │   ├── index.ts            ← 36 tools + 14 CLI + service (监听 ConvAdd 自动 send)
 │   ├── services/
 │   │   ├── websocket-service.ts  ← WS 客户端 + DeviceAuth + 3s 心跳 + 重连
-│   │   ├── send-helper.ts        ← 全部发送函数 (字符串化 + base64 + enum 名字)
+│   │   ├── send-helper.ts        ← 全部发送函数 (字符串化 + base64 + enum 名字) + *WithRetry 版
+│   │   ├── ai-command.ts         ← /ai 命令处理 (spawn agent 子进程 + 回执给个人微信)
 │   │   ├── storage-service.ts    ← SQLite (含 pending_tasks 跨进程 IPC)
 │   │   └── ...
 │   ├── tools/              ← 36 个 OpenClaw agent tools 注册
@@ -196,10 +223,14 @@ wework-openclaw-plugin/
 └── proto/                  ← 75 个 .proto 文件 (Java 后端协议定义)
 ```
 
-## Git 提交清单 (待 push)
+## Git 提交清单 (已全部 push 到 GitHub)
 
 ```
-1eb97bb fix(group): 建群欢迎发到真实群 RemoteId 不是 Java 内部 Id    ← 关键修复
+2a0caeb fix: send 路径加内置重试 — 解决 LLM 子进程序列被 Java pluginbot-cli 互踢的瞬时失败  ← 新
+f6714d4 docs: HANDOVER 同步今晚最终成果 + Web /user/** 鉴权止血
+639ec8f feat: 视频/文件转发 — 加 MsgRemoteId+FileType + DownloadFileResultNotice 监听
+7e7ee37 feat: 视频/文件转发 — 加 resolve-media + 诚实告知 SDK 限制
+1eb97bb fix(group): 建群欢迎发到真实群 RemoteId 不是 Java 内部 Id
 45af784 test: 业务场景脚本 - 建vip群+欢迎/朋友圈带图/群发促销
 c417185 test: smoke-test.sh - 验证服务/数据库/账号/CLI/连接全套
 7a9d84d docs: 完整 README - 架构/部署/CLI/场景/故障排查/协议细节
@@ -238,12 +269,14 @@ exec env WEWORK_PLUGIN_ENABLE=1 openclaw wework "$@"
 
 ## 已知遗留 / 未来工作
 
-1. **LLM Agent 自然语言驱动** — 等你提供 API key 接入
-2. ~~**wework upload 自动连发**~~ — ✅ 已实现 `wework send-image <wxId> <convId> <localPath>`, 一条龙上传+发送 (b621859 之后某个 commit, SSH 卡死还没 deploy)
-3. **群操作 dashed action 名字** — 当前用下划线 (set_name/add_member), 想用 PascalCase (RoomName/AddMember) 也可以, 只是 CLI 风格
-4. **pending_tasks 还能扩展** — 不只用于建群+欢迎, 还可以做"加好友成功后自动打标签"等异步链
-5. **撤回 / 转发 CLI 没实战测过** — 命令注册了但没找到合适的 msgId 测, 协议跟 send 一致应该 work
-6. ~~**sshd fork 资源耗尽**~~ — ✅ **已根治** (12:53). 真凶不是 sshd 不是 fork, 是**内存严重不够 + 没 swap**:
+1. ~~**LLM Agent 自然语言驱动**~~ — ✅ Kimi (moonshot.cn) 已接入, /ai 命令端到端 OK
+2. ~~**wework upload 自动连发**~~ — ✅ 已实现 `wework send-image <wxId> <convId> <localPath>`, 一条龙上传+发送
+3. **MCP 工具 spawn 子进程模型** — 当前每个 LLM 工具调用都 spawn 新的 `openclaw wework <cmd>` 子进程, 启动+auth ~6s, 序列长会有重复成本. 治本是直接走主 service 的 in-process RPC. 风险大没动, 已用 sendToJavaWithRetry band-aid 兜住瞬时失败.
+4. **Web 鉴权治本** — 当前 `Constant.TOKEN` 静态写死, 公开仓库会泄. 改 JWT + BCrypt 密码哈希 (~1-2h)
+5. **Java 安全优化** — fileUpload 没大小/类型限制, CORS `Allow-Origin: *` 全开放, 待收
+6. **pending_tasks 还能扩展** — 不只用于建群+欢迎, 还可以做"加好友成功后自动打标签"等异步链
+7. **撤回 / 转发 CLI** — revoke / forward / forward-multi 命令注册了, 协议跟 send 一致, 没找到合适的 msgId 实战测
+8. ~~**sshd fork 资源耗尽**~~ — ✅ **已根治** (12:53). 真凶不是 sshd 不是 fork, 是**内存严重不够 + 没 swap**:
    - 3.4G RAM, Java 占 860M / MySQL 386M / OpenClaw 372M, 实际可用只剩 342M
    - SSH 要 fork+exec 新 bash 时内核分不出内存 → fork 失败 → banner timeout
    - 修法: `fallocate -l 2G /swapfile && mkswap && swapon`, 写 fstab, swappiness=10
