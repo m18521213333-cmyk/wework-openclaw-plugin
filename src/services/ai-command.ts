@@ -117,22 +117,27 @@ export function handleAiCommand(ctx: CmdContext): boolean {
 
 媒体发送工作流 (用户说"把刚发的 X 个媒体发给YY, 加文字Y"):
 1. wework__wework_recent_media(wxId, senderId=${ctx.senderId}, limit=N) 拿 URL 列表
-   每条返回: contentType, url, msgId, forwardable, thumbUrl, reason
+   每条返回: contentType, url, msgId, forwardable, isOutgoing, thumbUrl, reason
 2. wework__wework_find_contact 找 YY 的 convId
 3. 先 wework__wework_send_message(wxId, convId, message=Y) 发文字
-4. 对每个媒体:
-   a. forwardable=true (Picture/Voice 一般 OK): wework_send_media_url(wxId, convId, url, mediaType) 真发出去
-      mediaType: Picture→image, Voice→voice
-   b. forwardable=false (Video/File 常态, 工作手机 SDK 限制不能 server-side 转发):
-      → 试 wework_resolve_media(wxId, msgId, waitSec=45) 触发手机下载到图床 (有时手机 SDK 不响应)
+4. 对每个媒体, 看 forwardable + isOutgoing 字段决策:
+   a. forwardable=true: wework_send_media_url(wxId, convId, url, mediaType) 真发出去
+      mediaType: Picture→image, Voice→voice, Video→video, File→file
+   b. forwardable=false 且 isOutgoing=true:
+      → **直接放弃 resolve_media** (工作手机 SDK 协议不支持重传 outgoing, resolve 必 60s 超时浪费时间)
+      → 老实告诉用户: "这是你自己发出去的 X, SDK 协议限制不能自动转发, 在企微 App 长按转发给YY 更快"
+   c. forwardable=false 且 isOutgoing=false (incoming 大图/视频/文件):
+      → 试 wework__wework_resolve_media(wxId, msgId, waitSec=45) 触发手机下载到图床
+      → resolve_media 内部已自动 transient 重试 (Java 报"其他任务下载中"会等几秒重试 3 次)
       → 成功就 wework_send_media_url 发
-      → 失败就**老实告诉用户**: "视频/文件因工作手机 SDK 限制无法自动转发, 你手动在企微转发更快".
-        如果有 thumbUrl 可以用 send_image_url 发缩略图作为预览.
+      → 失败 (Java 永久错误 / SDK 静默超时): 老实告诉用户失败原因, 建议手动转发,
+        有 thumbUrl 可以用 send_image_url 发缩略图作为预览
 
 绝对不能做的事:
 - 转发媒体用 wework_send_message(发文字 URL 字符串), 接收方看到链接不是真媒体
 - 谎报"已发送"成功, resolve_media 失败时必须老实告诉用户
-- 视频/文件的 url 字段是 /storage/emulated/... 手机本地路径不是公网, 永远不能直接 send
+- 媒体的 url 字段是 /storage/emulated/... 手机本地路径不是公网, 永远不能直接 send
+- isOutgoing=true 的媒体不要调 resolve_media (注定失败浪费 60s)
 
 回复格式要求:
 - 用纯文本, 不要 markdown 表格 / 列表 / 代码块 (微信不渲染)

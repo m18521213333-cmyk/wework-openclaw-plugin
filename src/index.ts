@@ -37,7 +37,7 @@ import { startScheduler, stopScheduler } from "./services/scheduler-service.js";
 import { startPhoneMonitor, stopPhoneMonitor } from "./services/phone-monitor.js";
 import { startContactSync, stopContactSync, handleContactPush, getLastSyncTime } from "./services/contact-sync.js";
 import { handleAiCommand } from "./services/ai-command.js";
-import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getMessageMeta } from "./services/storage-service.js";
+import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getResolvedMediaStatus, clearResolvedMediaRecord, isTransientResolveError, getMessageMeta } from "./services/storage-service.js";
 
 // send-helper (CLI 直接调用)
 // 子进程模式下 Java pluginbot-cli 经常被互踢, 所有 send 路径都走 withRetry 版.
@@ -525,12 +525,16 @@ export default definePluginEntry({
         .description("视频/文件 Java 没存图床时, 触发手机上传 + 等 Result 通知 + 返回真 URL")
         .argument("<wxId>", "企业微信ID")
         .argument("<msgId>", "消息 MsgId (从 history 拿)")
-        .option("-w, --wait <s>", "最大等待秒数 (大文件可加大)", "60")
+        .option("-w, --wait <s>", "单次最大等待秒数 (大文件可加大)", "60")
         .option("-t, --file-type <n>", "FileType: 0=原始(默认通用) 1=大图 4=语音 5=视频 6=文件", "0")
+        .option("--max-retries <n>", "Java 报 transient 错误时重试几次", "3")
+        .option("--retry-wait <s>", "transient 重试间隔秒数", "5")
         .option("--json", "JSON 输出")
-        .action(withConnection(async (wxId: string, msgId: string, opts: { wait: string; fileType: string; json?: boolean }) => {
+        .action(withConnection(async (wxId: string, msgId: string, opts: { wait: string; fileType: string; maxRetries: string; retryWait: string; json?: boolean }) => {
           const waitSec = parseInt(opts.wait, 10) || 60;
           const fileType = parseInt(opts.fileType, 10) || 0;
+          const maxRetries = parseInt(opts.maxRetries, 10) || 3;
+          const retryWaitSec = parseInt(opts.retryWait, 10) || 5;
           // 1. 拿 msg_remote_id (Java 协议要求, web 端实测必传)
           const meta = getMessageMeta(wxId, msgId);
           if (!meta) {
@@ -538,19 +542,15 @@ export default definePluginEntry({
             return;
           }
           const msgRemoteId = meta.msg_remote_id ?? "";
-          // 2. 触发下载 (含 MsgRemoteId + FileType, 否则手机 SDK 不响应)
-          const trig = await downloadByMsgIdWithRetry(wxId, msgId, String(msgRemoteId), fileType);
-          if (!trig.success) {
-            console.log(opts.json ? JSON.stringify({ ok: false, error: trig.error }) : `❌ 触发下载失败: ${trig.error}`);
+          // 1b. 预检查: msg_remote_id 缺失 → SDK 不会响应, fail-fast
+          // (web 端实测, 手机 SDK 必须看到 MsgRemoteId 才会启动下载. 不传 = 静默丢弃)
+          if (!msgRemoteId) {
+            const err = "msg_remote_id 缺失 (该消息可能不是从手机 SDK 推过来, 或落库时漏了字段). 手机 SDK 不会响应 download 请求.";
+            console.log(opts.json ? JSON.stringify({ ok: false, error: err }) : `❌ ${err}`);
             return;
           }
-          // 3. 等 DownloadFileResultNotice 回写 (内存里那个 _resolvedMediaUrls map)
-          // 注意 service 进程才会收到 notice, CLI 这个进程是新连接, 自己不收 notice.
-          // 所以这里的等待依赖 service 进程在 notice 来时更新 SQLite (TODO 加).
-          // 当前 fallback: poll 文件系统 + memory map (各自检查)
-          const startMs = Date.now();
-          let foundUrl = "";
-          // 也保留文件系统 fallback
+
+          // 文件系统 fallback 用的 hash (从原 url 提)
           const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
           const yesterday = new Date(Date.now() - 86400_000).toISOString().slice(0, 10).replace(/-/g, "");
           let originalUrl = "";
@@ -561,29 +561,108 @@ export default definePluginEntry({
           const hashMatch = originalUrl.match(/([a-fA-F0-9]{32})/);
           const hash = hashMatch?.[1]?.toUpperCase() ?? "";
 
-          while (Date.now() - startMs < waitSec * 1000) {
-            // 优先查 memory map (DownloadFileResultNotice 推送)
-            const mem = getResolvedMediaUrl(msgId);
-            if (mem) { foundUrl = mem; break; }
-            // 备用: 文件系统 hash 匹配
-            if (hash) {
-              for (const date of [today, yesterday]) {
-                const dir = `/app/storage/attachment/${date}`;
-                if (fs.existsSync(dir)) {
-                  const match = fs.readdirSync(dir).find((f) => f.toUpperCase().startsWith(hash + "."));
-                  if (match) { foundUrl = `http://60.205.94.161/attachment/${date}/${match}`; break; }
-                }
-              }
-              if (foundUrl) break;
+          // 1c. 清掉旧的 resolved_media 记录 (上次失败的 stale 不能影响这次判断)
+          // 不清的话: 旧 success=false 记录会让首次 poll 立即拿到, 跳过等新 notice 的过程, 误判 permanent
+          clearResolvedMediaRecord(msgId);
+
+          // 2. 触发 + 等结果 — 带 transient 重试 (实测 Java "其他任务下载中" 等几秒就好)
+          const startTotalMs = Date.now();
+          let foundUrl = "";
+          let lastErrMsg: string | undefined;
+          let attempts = 0;
+
+          for (let retry = 0; retry <= maxRetries; retry++) {
+            attempts++;
+            // 触发下载 (含 MsgRemoteId + FileType, 否则手机 SDK 不响应)
+            const trig = await downloadByMsgIdWithRetry(wxId, msgId, String(msgRemoteId), fileType);
+            if (!trig.success) {
+              lastErrMsg = `触发下载失败 (WS 层): ${trig.error}`;
+              break;
             }
-            await new Promise((r) => setTimeout(r, 1500));
+
+            // 轮询: pending / success / failed
+            const attemptStartMs = Date.now();
+            let attemptResult: "success" | "transient_failed" | "permanent_failed" | "timeout" = "timeout";
+            let attemptErr: string | undefined;
+
+            while (Date.now() - attemptStartMs < waitSec * 1000) {
+              const status = getResolvedMediaStatus(msgId);
+              if (status.state === "success") {
+                foundUrl = status.url;
+                attemptResult = "success";
+                break;
+              }
+              if (status.state === "failed") {
+                attemptErr = status.errMsg;
+                if (isTransientResolveError(status.errMsg)) {
+                  // 已知 transient 关键词 → 后续 retry
+                  attemptResult = "transient_failed";
+                } else if (!status.errMsg) {
+                  // Java 回 success=false 但没给 ErrMsg — 不知道是 SDK 静默拒绝 (permanent)
+                  // 还是 protocol 把字段丢了 (transient). 给一次 retry 机会, 不要直接判 perm.
+                  attemptResult = "transient_failed";
+                  attemptErr = "Java 回 success=false 但未提供 ErrMsg (可能 SDK 静默拒绝)";
+                } else {
+                  // Java 给了具体的非 transient 错误 → 重试无用
+                  attemptResult = "permanent_failed";
+                }
+                break;
+              }
+              // pending: 轮询期间也试文件系统 hash 匹配 (Java 没发 notice 但实际下完了的兜底)
+              if (hash) {
+                for (const date of [today, yesterday]) {
+                  const dir = `/app/storage/attachment/${date}`;
+                  if (fs.existsSync(dir)) {
+                    const match = fs.readdirSync(dir).find((f) => f.toUpperCase().startsWith(hash + "."));
+                    if (match) {
+                      foundUrl = `http://60.205.94.161/attachment/${date}/${match}`;
+                      attemptResult = "success";
+                      break;
+                    }
+                  }
+                }
+                if (foundUrl) break;
+              }
+              await new Promise((r) => setTimeout(r, 1500));
+            }
+
+            if (attemptResult === "success") break;
+            lastErrMsg = attemptErr ?? "(SDK 静默超时)";
+
+            if (attemptResult === "permanent_failed") {
+              // Java 明确报错且非 transient — 重试也没用
+              console.log(opts.json
+                ? JSON.stringify({ ok: false, error: "permanent", javaErr: lastErrMsg, attempts, hash })
+                : `❌ Java 永久错误: ${lastErrMsg} (重试无用)`);
+              return;
+            }
+
+            if (attemptResult === "timeout") {
+              // SDK 60s 静默 — 一般是 SDK 不支持 / 文件已删 / outgoing 自己发的
+              break; // 不进入重试 (重试也是静默)
+            }
+
+            // attemptResult === "transient_failed" → Java 暂时繁忙, 等几秒重试
+            if (retry < maxRetries) {
+              if (!opts.json) console.log(`⏳ Java 繁忙 ("${lastErrMsg}"), ${retryWaitSec}s 后重试 (${retry + 1}/${maxRetries})...`);
+              clearResolvedMediaRecord(msgId);  // 清掉旧失败记录, 等新 notice
+              await new Promise((r) => setTimeout(r, retryWaitSec * 1000));
+            }
           }
+
+          // 收尾输出
+          const totalSec = Math.round((Date.now() - startTotalMs) / 1000);
           if (foundUrl) {
-            console.log(opts.json ? JSON.stringify({ ok: true, url: foundUrl, waitedMs: Date.now() - startMs })
-              : `✅ 已到位 (${Math.round((Date.now() - startMs) / 1000)}s): ${foundUrl}`);
+            console.log(opts.json ? JSON.stringify({ ok: true, url: foundUrl, waitedSec: totalSec, attempts })
+              : `✅ 已到位 (${totalSec}s, 试了 ${attempts} 次): ${foundUrl}`);
+          } else if (lastErrMsg && lastErrMsg !== "(SDK 静默超时)") {
+            // Java 有反馈, 重试 maxRetries 次仍 transient
+            console.log(opts.json ? JSON.stringify({ ok: false, error: "transient_exhausted", javaErr: lastErrMsg, attempts, hash, waitedSec: totalSec })
+              : `❌ Java 报错 "${lastErrMsg}" 重试 ${attempts} 次仍失败 (用了 ${totalSec}s)`);
           } else {
-            console.log(opts.json ? JSON.stringify({ ok: false, error: "timeout", hash, waitedSec: waitSec })
-              : `❌ ${waitSec}s 内手机 SDK 没响应. 可能视频/文件 SDK 不支持自动上传.`);
+            // 60s 内 Java 啥也没回 — SDK 静默
+            console.log(opts.json ? JSON.stringify({ ok: false, error: "sdk_silent_timeout", hash, waitedSec: totalSec, attempts })
+              : `❌ ${totalSec}s 内手机 SDK 静默无响应 (常见: outgoing 自己发的不能重传 / 大图缓存清了 / SDK 协议不支持). 退回手动转发更稳.`);
           }
         }));
 
@@ -785,9 +864,22 @@ export default definePluginEntry({
         .description("发送消息")
         .argument("<wxId>", "企业微信ID")
         .argument("<convId>", "目标会话ID")
-        .argument("<message>", "消息内容")
-        .option("-t, --type <type>", "消息类型: text/image/file/link", "text")
+        .argument("<message>", "消息内容 (text 类型 = 文字; 其他类型 = http(s) URL)")
+        .option("-t, --type <type>", "消息类型: text/image/voice/video/file/link", "text")
         .action(withConnection(async (wxId: string, convId: string, message: string, opts: { type: string }) => {
+          // 预检查: 非 text 类型必须是 http(s) URL
+          // (LLM 偶尔会把 /storage/emulated/... 这种手机本地路径直接当 URL 发, Java 收到后媒体打不开,
+          //  接收方看到红色感叹号. 这里 fail-fast 让 LLM 立刻拿到错误反馈)
+          const t = opts.type.toLowerCase();
+          if (t !== "text" && t !== "link") {
+            if (!/^https?:\/\//i.test(message)) {
+              const err = `❌ ${t} 类型必须是 http(s) URL, 不能是手机本地路径 / 文件路径. 收到: ${message.slice(0, 80)}${message.length > 80 ? "..." : ""}`;
+              console.log(err);
+              console.log(`   ↳ 如果想发本地图片, 先 wework upload <path> 拿 URL, 或者用 wework send-image <wxId> <convId> <localPath> 一条龙.`);
+              console.log(`   ↳ 如果想转发用户发的媒体, 先 wework recent-media + wework resolve-media 拿真 URL.`);
+              return;
+            }
+          }
           const r = await sendMessageWithRetry(wxId, convId, message, opts.type, undefined, {
             attempts: 4, waitForConnectMs: 15000,
             onAttempt: (n, info) => {

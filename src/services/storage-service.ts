@@ -225,7 +225,7 @@ export function listPhoneStatusEvents(wxId?: string, limit = 50): any[] {
 export function getRecentMediaFromSender(wxId: string, senderId: string, withinMinutes = 30, limit = 10): any[] {
   const db = getDb();
   const rows = db.prepare(`
-    SELECT content_type, content, msg_id, datetime(created_at, 'localtime') AS ts
+    SELECT content_type, content, msg_id, is_send, datetime(created_at, 'localtime') AS ts
     FROM messages
     WHERE wx_id=? AND sender_id=?
       AND content_type IN ('Picture', 'Voice', 'Video', 'File', '2', '3', '4', '5')
@@ -278,14 +278,34 @@ export function getRecentMediaFromSender(wxId: string, senderId: string, withinM
     // 我们标记 forwardable=false, LLM 看到就别瞎报"成功".
     const forwardable = !!url && /^https?:\/\//.test(url);
 
+    // is_send 在 SQLite 里是字符串 "true"/"false". true = 我们/工作手机发出去的 (outgoing)
+    const isOutgoing = String(r.is_send) === "true";
+
+    // forwardable=false 的具体原因区分 (LLM 拿到能选对策略, 不要无脑试 resolve 浪费 60s)
+    let reason: string | undefined;
+    if (!forwardable) {
+      if (isOutgoing) {
+        // 工作手机自己发出去的媒体, SDK 协议不支持重新上传 (官方限制).
+        // resolve_media 注定 60s 静默超时 → 别让 LLM 试.
+        reason = "outgoing 自己发出去的媒体, 工作手机 SDK 不支持重传到图床. resolve_media 必失败 (60s 静默超时), 直接告诉用户在企微 App 里手动转发.";
+      } else if (!url) {
+        // incoming 但 url 完全空 — 大图/原图 Java 没自动入图床. 试 resolve.
+        reason = "incoming 大图未自动入图床 (常见于原图/视频). 先用 wework_resolve_media(msgId) 触发手机 SDK 上传, 拿到 URL 再 send_media_url. 失败 (其他任务下载中=Java 繁忙→已自动重试) 退回手动转发.";
+      } else {
+        // incoming 但 url 是 /storage/emulated/... 之类手机本地路径
+        reason = "incoming 媒体, URL 是手机本地路径 (公网不可下). 用 wework_resolve_media(msgId) 触发手机 SDK 上传到图床, 拿到真 URL 再 send_media_url.";
+      }
+    }
+
     return {
       contentType: r.content_type,
       url: forwardable ? url : "",
       thumbUrl,
       ts: r.ts,
       msgId: r.msg_id,
+      isOutgoing,
       forwardable,
-      reason: forwardable ? undefined : "Java 没存图床, URL 是手机本地路径. 用 wework_resolve_media(msgId) 触发下载到图床, 等到位后再转发.",
+      reason,
       thumbUrlForwardable: !!thumbUrl && /^https?:\/\//.test(thumbUrl),
     };
   });
@@ -297,13 +317,13 @@ export function getLastMediaFromSender(wxId: string, senderId: string, withinMin
   return list[0] ?? null;
 }
 
-// 内存里记 msgId → 已下载到图床的真实 URL
+// 内存里记 msgId → 已下载到图床的真实 URL (含失败信息)
 // 由 DownloadFileResultNotice 推送时填进来, resolve-media 命令轮询
-const _resolvedMediaUrls = new Map<string, { url: string; ts: number }>();
+const _resolvedMediaUrls = new Map<string, { url: string; ts: number; success: boolean; errMsg?: string }>();
 
 export function recordResolvedMediaUrl(msgId: string, url: string, fileType?: number, success = true, errMsg?: string): void {
   if (!msgId) return;
-  _resolvedMediaUrls.set(msgId, { url, ts: Date.now() });
+  _resolvedMediaUrls.set(msgId, { url, ts: Date.now(), success, errMsg });
   // 同时写 SQLite 跨进程同步 (CLI/agent 进程能查到)
   try {
     const db = getDb();
@@ -320,16 +340,72 @@ export function recordResolvedMediaUrl(msgId: string, url: string, fileType?: nu
   } catch { /* ignore */ }
 }
 
+/** 已下载的真实 URL — 简化版, 只成功才返回 (向后兼容) */
 export function getResolvedMediaUrl(msgId: string): string | null {
+  const s = getResolvedMediaStatus(msgId);
+  return s.state === "success" ? s.url ?? null : null;
+}
+
+/**
+ * 已下载的状态 (区分 pending/success/failed) + 错误信息.
+ * 给 resolve-media CLI 用: 区分"还在等"vs"Java 报错"vs"成功"
+ */
+export type MediaStatus =
+  | { state: "pending" }
+  | { state: "success"; url: string }
+  | { state: "failed"; errMsg?: string };
+
+export function getResolvedMediaStatus(msgId: string): MediaStatus {
+  if (!msgId) return { state: "pending" };
   // 先查内存 (service 进程自己写的最快)
-  const mem = _resolvedMediaUrls.get(msgId)?.url;
-  if (mem) return mem;
-  // 再查 SQLite (跨进程)
+  const mem = _resolvedMediaUrls.get(msgId);
+  if (mem) {
+    if (mem.success && mem.url) return { state: "success", url: mem.url };
+    return { state: "failed", errMsg: mem.errMsg };
+  }
+  // 再查 SQLite (跨进程: CLI 子进程读 service 进程写的)
   try {
     const db = getDb();
-    const r = db.prepare("SELECT url, success FROM resolved_media WHERE msg_id=?").get(msgId) as any;
-    return r?.success ? r.url : null;
-  } catch { return null; }
+    const r = db.prepare("SELECT url, success, err_msg FROM resolved_media WHERE msg_id=?").get(msgId) as any;
+    if (!r) return { state: "pending" };
+    if (r.success && r.url) return { state: "success", url: r.url };
+    return { state: "failed", errMsg: r.err_msg ?? undefined };
+  } catch {
+    return { state: "pending" };
+  }
+}
+
+/**
+ * 清掉某 msgId 的 resolved_media 记录 (内存 + SQLite).
+ * 给 transient 重试用: Java 报"其他任务下载中"后, 清掉失败记录, 重发 download 触发, 等新结果.
+ */
+export function clearResolvedMediaRecord(msgId: string): void {
+  if (!msgId) return;
+  _resolvedMediaUrls.delete(msgId);
+  try {
+    const db = getDb();
+    db.prepare("DELETE FROM resolved_media WHERE msg_id=?").run(msgId);
+  } catch { /* ignore */ }
+}
+
+/**
+ * 判断 errMsg 是否 Java/SDK 的"暂时性繁忙"错误 — 应该等几秒重试.
+ * 关键词从实测日志归纳, 后续遇到新关键词加进来.
+ */
+export function isTransientResolveError(errMsg: string | undefined): boolean {
+  if (!errMsg) return false;
+  const msg = errMsg.toLowerCase();
+  const transientKeywords = [
+    "其他任务下载中",  // 5/5 实测: Java SDK 同时只下一个文件, 后续请求拒
+    "下载中",           // 兜底变体
+    "繁忙",
+    "busy",
+    "in progress",
+    "another task",
+    "rate limit",
+    "请稍后",
+  ];
+  return transientKeywords.some((k) => errMsg.includes(k) || msg.includes(k.toLowerCase()));
 }
 
 // 给 resolve-media 用: 顺便从 messages 表读 msg_remote_id
