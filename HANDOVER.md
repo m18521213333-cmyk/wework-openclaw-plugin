@@ -73,6 +73,25 @@ LLM (Kimi via moonshot.cn) 自动:
 - 凭据归档: `/root/credentials.txt` (mode 600 仅 root 可读) — **抄一份到本地密码管理器**
 - 验证: 新密码 web 登录返回 token, 旧密码返回"账号或密码错误", health 全绿
 
+## 已修的 resolve_media 失败场景 (5/5 下午 14:43)
+
+实测 13:46 那次 /ai 转发自己发的图给陈攀攀失败 (`其他任务下载中`). 系统梳理 8 个失败模式发现当前代码只覆盖 3 种, 补全到 7 种 (commit `2bafde5`):
+
+新加能力:
+- `recent_media` 加 `isOutgoing` 字段 — LLM 别在自己发的媒体上浪费 60s 试 resolve
+- `getResolvedMediaStatus` 返 state (pending/success/failed) + errMsg — 之前只能拿 url 或 null
+- `clearResolvedMediaRecord` — transient 重试时清 stale, 重发 download
+- `isTransientResolveError` — 关键词识别 Java/SDK 暂时繁忙
+- CLI `resolve-media` 改造: msg_remote_id 预检 + clear stale + 多轮 retry + 错误文案区分 3 结局
+- CLI `send` 加 url 预检 — 非 text 类型必须 http(s)
+- ai-command enrichedPrompt 教 LLM 用 isOutgoing 决策
+
+实测对比 (同一个失败 msgId):
+- 改前: 60s 静默超时 + 误报 permanent
+- 改后: 11s 内 3 次 transient 重试, 文案准确
+
+**详细失败场景手册见 [PLAYBOOK.md](./PLAYBOOK.md)** — 8 个场景, 每个怎么手动触发 + 期望行为 + 真出问题的诊断步骤.
+
 ## 已修的 P0 安全 (5/5 中午 11:08) — Web 鉴权治本 (JWT)
 
 之前 `Constant.TOKEN = "33DD94BBF49356583E460D1FA2907EDB"` 是**所有 web 接口共用一个静态字符串**, 一泄露就全员失守. 公开仓库 / 抓包 / 代码搜都能拿到.
@@ -200,6 +219,7 @@ ssh wework-prod 'wework group 1688852285335663 create \
 
 | 时间 | bug | 修法 |
 |---|---|---|
+| **5/5 14:43** | resolve_media 8 个失败场景只覆盖 3 个 (其他任务下载中 立刻放弃 / outgoing 浪费 60s 试 resolve / 错误文案误导) | 全梳理 + 补 7 个 case + isOutgoing 字段 + transient 重试 (commit 2bafde5). PLAYBOOK.md 留 8 场景演练手册 |
 | **5/5 11:08** | Web 静态 token 治本 (`Constant.TOKEN` 任何人拿到都通行) | JWT 改造 (Java commit e8cc347 on feat/web-jwt-auth) |
 | **5/5 10:30** | LLM 群发 N 联系人时 send 路径瞬时失败 ("未连接 Java 后端") — 子进程 pluginbot-cli 互踢 | send-helper 加 `*WithRetry` 等重连+指数退避 (commit 2a0caeb) |
 | **5/5 09:35** | 5 个账号弱密码 `1q2w3e4r5t` (键盘对角线) | 24 位独立随机 alnum + openclaw.json 同步 |
