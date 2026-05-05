@@ -1,20 +1,39 @@
-# 🎁 一晚的成果 — 给你的早晨咖啡读物
+# 🎁 wework-openclaw-plugin — 完整接手文档
 
-> 5/3 早 → 5/4 凌晨, ~16 小时, 修了 10 个底层 bug, 全链路真打通.
-> 你睡觉时我把 commit + 文档 + 测试脚本都搞定了.
-> 这份 HANDOVER 给你 5 分钟看完接手.
+> 5/3 早 → 5/5 凌晨, ~25 小时, 24 个 commit, 全媒体闭环验证通过.
+> 任何新会话只看这份 30 秒能接上.
 
-## TL;DR
+## ⭐ 终极形态 (今晚 5/5 凌晨实测落地)
 
 ```
-✅ 接收链路:    客户/手机 → Java → OpenClaw 插件 → SQLite (落库 26+ 行真实消息)
-✅ 发送链路:    OpenClaw 插件 CLI → Java → 手机 SDK → 客户企微
+你 (任何地方, 只要有手机)
+  ↓ 个人微信发到孟伟企微
+"/ai 把刚发的图/音/视频/文件/朋友圈 发给客户XX [+ 文字Y]"
+  ↓ 30-60s
+LLM (Kimi via moonshot.cn) 自动:
+  recent_media → resolve_media (视频/文件触发手机 SDK 上传) → send_media_url
+  ↓
+客户 XX 企微收到原始媒体 ✅
+你个人微信收到 "✅ 已处理: ..." 报告
+```
+
+## TL;DR (今晚最终版)
+
+```
+✅ 接收链路:    客户 → Java → 插件 SQLite (含 contacts 204 个 + messages + resolved_media)
+✅ 发送链路:    LLM Agent / CLI → Java → 手机 SDK → 客户企微
                   ├─ 单聊文本 ✅       ├─ 单聊图片 ✅
-                  ├─ 群聊消息 ✅       ├─ 群发 ✅
-                  ├─ 朋友圈纯文 ✅     └─ 朋友圈带图 ✅
-✅ 业务流程:    建群 + 自动发欢迎 — 02:14 vip0212修复后群你确认收到 (用对的 RemoteId)
-✅ 14 个 CLI:   全部实操跑通 (status/send/mass-send/moments/group/history/...)
-✅ 36 个 Tools: 注册到 OpenClaw, 可被 LLM Agent 调用 (需配 LLM API key)
+                  ├─ 单聊语音 ✅       ├─ 单聊视频 ✅ (resolve-media 触发上传)
+                  ├─ 单聊文件 ✅       ├─ 群聊消息 ✅
+                  ├─ 群发 ✅            ├─ 朋友圈纯文 ✅
+                  └─ 朋友圈带多图 ✅
+
+✅ /ai 命令模式: 个人微信发 /ai → plugin 接 → spawn agent → 回复结果给你个人微信
+✅ LLM 工具:     19 个 MCP tool 暴露给 Kimi (find/send/upload/resolve/post_moments/...)
+✅ 业务流程:    建群+欢迎 (RemoteId 修了); 看历史智能回复; 多媒体转发
+✅ 守护:         phone-monitor (60s 巡 isonline); contact-sync (30min); MCP 离线拒绝
+✅ 资源:         ECS 升 4C/8G; sshd swap 2G; Java AsyncConfig 10000→50 (省 3GB 虚内存)
+✅ OpenClaw:    2026.5.2 (修了 PATH 软链 + bashrc alias + 删 user-systemd 重复 gateway)
 ```
 
 ## ⚠️ 最后一个 bug (1eb97bb commit)
@@ -34,9 +53,47 @@
 | vip0140群 (老) | 10707935695300817 | 7635721978515543455 |
 | 智简vip0122 (老) | 10696529405848940 | 7635717172447138863 |
 
-## 早上你做这 4 件事就够
+## 已修的 P0 安全 (5/5 凌晨 08:11)
 
-### 1. push 我攒的 6 个 commit 到 GitHub (5 分钟)
+**Web 端 /user/** 鉴权快速止血**:
+- `WebConfiguration.java` 把 `/user/**` 从 excludePathPatterns 删了, 只留 `/user/login`
+- 任何调用 `/user/account/*` 等接口必须带 `token: 33DD94BBF49356583E460D1FA2907EDB` header
+- Web 前端登录后自动带, 业务正常
+- **公开仓库后这个静态 token 还是会泄, 治本要改 JWT (待办)**
+
+`/opt/wework/wework-server/` 已重新编译部署. 备份在 `/tmp/wework-patches/WebConfiguration.java.orig` 万一要回滚.
+
+## 你要做的 3 件事 (按紧急度)
+
+### 0. 关键命令一览
+
+```bash
+# 自然语言驱动 (终极形态)
+ssh wework-prod 'wework-ai "给客户XX发祝福: 周末愉快"'
+
+# 或 你个人微信发到孟伟企微 (任意会话):
+/ai 把刚发的 4 张图发给余燕
+/ai 把刚才的视频发给赵丽
+/ai 看周丁豪聊了啥, 给个得体回复
+
+# 综合健康
+ssh wework-prod 'wework health'
+
+# 联系人查找/列表 (本地缓存 204 个)
+wework contacts 1688852285335663
+wework find-contact 1688852285335663 赵丽
+
+# 历史 (直读 SQLite, 含 base64 解码)
+wework history 1688852285335663 <convId> -n 10
+
+# 媒体 URL 解析 (视频/文件)
+wework resolve-media 1688852285335663 <msgId>
+
+# 业务场景一键
+/root/.openclaw/extensions/wework-scrm/scripts/scenarios.sh all
+```
+
+### 1. push 24 commit 到 GitHub (5 分钟)
 
 我已经 commit 到本地 (b86a218 → cb082b8 → 7a9d84d → c417185 → 45af784 → **1eb97bb**)。push 失败因为 mac 没加 GitHub SSH key。两种方式选一个:
 
