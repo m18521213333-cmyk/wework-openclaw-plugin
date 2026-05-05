@@ -287,8 +287,20 @@ async function runMcpTool(name: string, args: Record<string, unknown>): Promise<
     throw new Error(`工具 ${name} 暂未在 agent backend 实现 (TODO)`);
   }
 
+  // 只有支持 --json 的 CLI 子命令才加 (查询类). send/mass-send/group 等 mutation
+  // 命令不支持, 加了会报 'unknown option --json' 错.
+  const JSON_SUPPORTED_SUBCMDS = new Set([
+    "find-contact", "recent-media", "resolve-media", "history", "search",
+    "contacts", "events", "phone", "status", "last-media", "send-image",
+    "my-moments", "moments", "group",
+  ]);
+  const subcmd = cliArgs[0];
+  const finalArgs = JSON_SUPPORTED_SUBCMDS.has(subcmd)
+    ? ["wework", ...cliArgs, "--json"]
+    : ["wework", ...cliArgs];
+
   return new Promise((resolve, reject) => {
-    execFile(AI_BIN, ["wework", ...cliArgs, "--json"], {
+    execFile(AI_BIN, finalArgs, {
       timeout: 60_000,
       maxBuffer: 5 * 1024 * 1024,
       encoding: "utf8",
