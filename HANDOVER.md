@@ -73,6 +73,45 @@ LLM (Kimi via moonshot.cn) 自动:
 - 凭据归档: `/root/credentials.txt` (mode 600 仅 root 可读) — **抄一份到本地密码管理器**
 - 验证: 新密码 web 登录返回 token, 旧密码返回"账号或密码错误", health 全绿
 
+## ⚠️ 5/5 下午 16:43 — 找到 SDK 全部媒体上传失败的真根因
+
+**症状**: 5/5 下午 /ai 转发任何 incoming 媒体 (图/音/视频/文件) 都报 "SDK 静默拒绝", forwardable=false 全部, URL 留 `/storage/emulated/...` 手机本地路径。
+
+**真根因**: 我 5/4 把 Java 后端 `AsyncConfig.java` 的 `corePoolSize` 从 **10000** 改到 **50** (出发点是省内存, corePool=10000 占 ~10GB 虚拟内存触发 swap):
+
+```java
+// 5/4 改的 (元凶):
+threadPool.setCorePoolSize(50);
+threadPool.setMaxPoolSize(500);
+// 原版:
+threadPool.setCorePoolSize(10000);
+threadPool.setMaxPoolSize(20000);
+```
+
+**为啥是 AsyncConfig 引起的**:
+- Java 内部 SDK 协议处理大量用 `@Async` 标注 (FriendTalkNotice 接收 / 文件接收 / 转发 PC 端 / 落库)
+- 这些都走 AsyncConfig 的 thread pool
+- corePool=50 + maxPool=500 + queue=10000 看起来够, 但 **SDK 高峰时单条媒体推送会触发几十个并发 @Async**
+- 50 被打满后走 `CallerRunsPolicy` (调用线程自己干) → 调用线程是 Netty event loop → 阻塞 Netty → 文件接收超时
+- 结果: SDK 推 FriendTalkNotice 时 URL 字段还是手机本地, 因为 Java 没来得及处理上传
+
+**症状演化**:
+- 5/4 改完没立刻爆 (那时负载低)
+- 5/5 09:29 Java 重启 (Step2 密码) → SDK 重连大量初始化任务 → 09:32 Video 挂
+- 5/5 11:07 Java 重启 (JWT) → 进一步退化 → 11:31 后全挂
+- 16:31 改回 corePool=10000 → 16:43 ✅ SDK 自动上传恢复
+
+**正确解决 OOM 应该这样做** (待优化, 不是今晚的事):
+- 不缩到 50, 中间值 **1000-2000** 试
+- 同时保留 swap (已做)
+- 改之前用 `jstack` profile 高峰 thread usage 确定真正需要的 size
+- 改后用 PLAYBOOK 跑一次回归 (8 个失败场景全过才能上)
+
+**今天的教训**:
+- 不要随便改框架默认 thread pool 大小, 即使看起来过配
+- 改 Java 后端任何 config 后必须真实负载测一遍 (我没做)
+- 5/4 那次改动**没及时回归测试**就上, 拖到 5/5 下午才发现, 浪费了大量时间 (gitee 1 个分支 + 反复重启 + 各种瞎猜)
+
 ## 已修的 resolve_media 失败场景 (5/5 下午 14:43)
 
 实测 13:46 那次 /ai 转发自己发的图给陈攀攀失败 (`其他任务下载中`). 系统梳理 8 个失败模式发现当前代码只覆盖 3 种, 补全到 7 种 (commit `2bafde5`):
