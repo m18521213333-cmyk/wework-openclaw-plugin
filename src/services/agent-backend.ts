@@ -346,6 +346,169 @@ export function startAgentBackend(opts: {
     res.json({ status: "ok", provider: opts.defaultProvider?.name ?? "(未配置)" });
   });
 
+  // ============================================
+  // 列表 API — 给 web v2 菜单页用 (ContactsView / ConversationsView 等)
+  // 复用 plugin 已有的 SQLite (storage-service)
+  // ============================================
+
+  // GET /api/contacts?wxId=&search=&limit=&offset=
+  app.get("/api/contacts", async (req, res) => {
+    try {
+      const wxId = String(req.query.wxId ?? "");
+      const search = String(req.query.search ?? "");
+      const limit = Math.min(parseInt(String(req.query.limit ?? "100"), 10) || 100, 500);
+      const offset = parseInt(String(req.query.offset ?? "0"), 10) || 0;
+      if (!wxId) {
+        res.status(400).json({ code: -1, msg: "wxId 必填" });
+        return;
+      }
+      // 直接读 SQLite (plugin 已建好 contacts 表)
+      const Database = (await import("better-sqlite3")).default;
+      const db = new Database("/root/wework-scrm.db", { readonly: true });
+      try {
+        // contacts 表实际字段: remote_id, name, alias, avatar, corp_id, corp_name, contact_type, gender, phone, job, last_synced_at
+        let sql = "SELECT remote_id, name, alias, avatar, corp_name, contact_type AS type, gender, phone, job AS position, last_synced_at AS last_seen FROM contacts WHERE wx_id=?";
+        const params: unknown[] = [wxId];
+        if (search) {
+          sql += " AND (name LIKE ? OR alias LIKE ?)";
+          params.push(`%${search}%`, `%${search}%`);
+        }
+        sql += " ORDER BY last_seen DESC LIMIT ? OFFSET ?";
+        params.push(limit, offset);
+        const rows = db.prepare(sql).all(...params);
+        const total = (db.prepare("SELECT COUNT(*) AS c FROM contacts WHERE wx_id=?").get(wxId) as { c: number }).c;
+        res.json({ code: 0, msg: "ok", data: { total, items: rows } });
+      } finally {
+        db.close();
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      opts.logger.error(`[api/contacts] ${msg}`);
+      res.status(500).json({ code: -1, msg });
+    }
+  });
+
+  // GET /api/conversations?wxId=&limit=
+  app.get("/api/conversations", async (req, res) => {
+    try {
+      const wxId = String(req.query.wxId ?? "");
+      const limit = Math.min(parseInt(String(req.query.limit ?? "50"), 10) || 50, 200);
+      if (!wxId) {
+        res.status(400).json({ code: -1, msg: "wxId 必填" });
+        return;
+      }
+      const Database = (await import("better-sqlite3")).default;
+      const db = new Database("/root/wework-scrm.db", { readonly: true });
+      try {
+        // 按 conv_id 聚合, 取最近一条作为 preview, 顺便统计未读条数
+        const rows = db.prepare(`
+          SELECT
+            conv_id,
+            MAX(sender_name) AS sender_name,
+            MAX(content_type) AS content_type,
+            MAX(content) AS last_content,
+            datetime(MAX(created_at), 'localtime') AS last_ts,
+            COUNT(*) AS msg_count
+          FROM messages
+          WHERE wx_id=? AND created_at > datetime('now', '-7 days')
+          GROUP BY conv_id
+          ORDER BY MAX(created_at) DESC
+          LIMIT ?
+        `).all(wxId, limit) as any[];
+        // 解码 base64 文本预览
+        const items = rows.map((r) => {
+          let preview = String(r.last_content ?? "");
+          try {
+            if (r.content_type === "Text" || r.content_type === "1") {
+              preview = Buffer.from(preview, "base64").toString("utf8");
+            } else {
+              preview = `[${r.content_type}]`;
+            }
+          } catch { /* ignore */ }
+          return { ...r, preview: preview.slice(0, 80), last_content: undefined };
+        });
+        res.json({ code: 0, msg: "ok", data: items });
+      } finally {
+        db.close();
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      opts.logger.error(`[api/conversations] ${msg}`);
+      res.status(500).json({ code: -1, msg });
+    }
+  });
+
+  // GET /api/messages?wxId=&convId=&limit=
+  app.get("/api/messages", async (req, res) => {
+    try {
+      const wxId = String(req.query.wxId ?? "");
+      const convId = String(req.query.convId ?? "");
+      const limit = Math.min(parseInt(String(req.query.limit ?? "50"), 10) || 50, 500);
+      if (!wxId || !convId) {
+        res.status(400).json({ code: -1, msg: "wxId + convId 必填" });
+        return;
+      }
+      const Database = (await import("better-sqlite3")).default;
+      const db = new Database("/root/wework-scrm.db", { readonly: true });
+      try {
+        const rows = db.prepare(`
+          SELECT msg_id, msg_remote_id, sender_id, sender_name, content_type, content, is_send,
+            datetime(created_at, 'localtime') AS ts
+          FROM messages
+          WHERE wx_id=? AND conv_id=?
+          ORDER BY id DESC LIMIT ?
+        `).all(wxId, convId, limit) as any[];
+        // 解码 base64 文本 content
+        const items = rows.map((r) => {
+          let content = String(r.content ?? "");
+          try {
+            if (r.content_type === "Text" || r.content_type === "1") {
+              content = Buffer.from(content, "base64").toString("utf8");
+            } else if (r.content_type === "Picture" || r.content_type === "Voice" || r.content_type === "Video" || r.content_type === "File") {
+              try {
+                const obj = JSON.parse(Buffer.from(content, "base64").toString("utf8"));
+                content = JSON.stringify(obj);
+              } catch { /* keep raw */ }
+            }
+          } catch { /* ignore */ }
+          return { ...r, content };
+        });
+        res.json({ code: 0, msg: "ok", data: items.reverse() });
+      } finally {
+        db.close();
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      opts.logger.error(`[api/messages] ${msg}`);
+      res.status(500).json({ code: -1, msg });
+    }
+  });
+
+  // GET /api/status/all — 给 StatusPanel 真用 (替换前端 mock)
+  app.get("/api/status/all", async (_req, res) => {
+    try {
+      // 先返 mock+部分真实, 后续逐步接 health 检查
+      res.json({
+        code: 0,
+        msg: "ok",
+        data: {
+          phones: [
+            { wxId: "1688852285335663", name: "孟伟@智简", isOnline: true, brand: "ZTE", module: "7531N" },
+          ],
+          java: { active: true, uptime: "—" },
+          plugin: { active: true, pid: process.pid },
+          redis: { active: true },
+          mysql: { active: true },
+          swap: { totalMb: 2047, usedMb: 0 },
+          memory: { availableMb: Math.round(process.memoryUsage().rss / 1024 / 1024) },
+        },
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      res.status(500).json({ code: -1, msg });
+    }
+  });
+
   // POST /api/agent/chat (SSE)
   app.post("/api/agent/chat", async (req: Request, res: Response) => {
     if (!opts.defaultProvider) {
