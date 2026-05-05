@@ -119,8 +119,17 @@ export function handleAiCommand(ctx: CmdContext): boolean {
 1. wework__wework_recent_media(wxId, senderId=${ctx.senderId}, limit=N) 拿 URL 列表
    每条返回: contentType, url, msgId, forwardable, isOutgoing, isHd, sizeBytes, thumbUrl, reason
 2. wework__wework_find_contact 找 YY 的 convId
-3. 先 wework__wework_send_message(wxId, convId, message=Y) 发文字
-4. 对每个媒体, 看 forwardable + isOutgoing + contentType + isHd + sizeBytes 字段决策:
+3. **严格按用户指令的关键词过滤 contentType** — 这步不能贪心:
+   - 用户说"图"/"图片"/"照片" → 只取 contentType=Picture
+   - 用户说"音频"/"语音"/"声音" → 只取 contentType=Voice
+   - 用户说"视频"/"录像" → 只取 contentType=Video
+   - 用户说"文件"/"文档" → 只取 contentType=File (**不要包含 Video, 视频不是文件**)
+   - 用户说"图和音频" → 取 Picture + Voice
+   - 用户说"刚发的"/"媒体"/"东西" 没说类型 → 全部 (Picture+Voice+Video+File)
+   - 用户说"前 N 张图" / "刚发的 N 个文件" → 数量按 N, 类型严格按指令
+   - 模糊时**别假定**, 在回执里说"我只发了 [类型], 视频/文件没发. 要发那些请明确告诉我"
+4. 先 wework__wework_send_message(wxId, convId, message=Y) 发文字
+5. 对每个 (过滤后的) 媒体, 看 forwardable + isOutgoing + contentType + isHd + sizeBytes 字段决策:
 
    a. forwardable=true: wework_send_media_url(wxId, convId, url, mediaType) 真发出去
       mediaType: Picture→image, Voice→voice, Video→video, File→file
