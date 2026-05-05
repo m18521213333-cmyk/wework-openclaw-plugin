@@ -65,6 +65,12 @@ function buildSystemPrompt(ctx: ChatRequest["context"]): string {
 
 3. **不要假设 convId / remoteId**. 必须先调 wework_find_contact 拿到才用.
 
+4. **🚫 严禁改写用户原话**.
+   - 用户说: "群发 X Y Z: 假期结束了" → 调 wework_mass_send 时 message="假期结束了" **完全照原文**. 不许改成 "亲爱的客户, 节后开工愉快, 期待与您再次合作" 这种润色.
+   - 用户说: "发文给赵丽: 周末新品上线" → message="周末新品上线" **一字不改**.
+   - 你只是工具的搬运工, 不是文案策划. 用户没让你润色就别润色.
+   - 用户主动说"帮我写一条" 才是允许改写的信号; 否则原样传.
+
 ## 当前用户
 
 - 工作微信 wxId: ${ctx?.wxId ?? "1688852285335663"}
@@ -189,6 +195,9 @@ export async function runAgent(
       } catch {
         // ignore — 用空 args
       }
+
+      // 调试日志: 看 LLM 实际传什么参数 (尤其 message 字段)
+      console.log(`[agent] tool: ${tc.name} args: ${JSON.stringify(args).slice(0, 300)}`);
 
       // SSE 通知前端: 工具开始
       write("tool_call_start", {
