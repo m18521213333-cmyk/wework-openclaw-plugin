@@ -282,17 +282,26 @@ export function getRecentMediaFromSender(wxId: string, senderId: string, withinM
     const isOutgoing = String(r.is_send) === "true";
 
     // forwardable=false 的具体原因区分 (LLM 拿到能选对策略, 不要无脑试 resolve 浪费 60s)
+    // 实测 5/5 + 看 Java/Web 前端源码: SDK 对 Picture 类型 DownloadFileByMsgId 经常返回
+    //   success=true 但 Url=""  (Web 前端处理: 弹"资源地址获取失败" 警告 — SDK 协议固有限制).
+    // 所以 Picture 类型几乎永远 resolve_media 失败. 别让 LLM 浪费时间试.
+    // Voice/Video/File 反而更可能成功 (实测今天 09:33 video 转赵丽 OK).
+    const isPicture = r.content_type === "Picture" || r.content_type === "2";
+
     let reason: string | undefined;
     if (!forwardable) {
       if (isOutgoing) {
         // 工作手机自己发出去的媒体, SDK 协议不支持重新上传 (官方限制).
-        // resolve_media 注定 60s 静默超时 → 别让 LLM 试.
-        reason = "outgoing 自己发出去的媒体, 工作手机 SDK 不支持重传到图床. resolve_media 必失败 (60s 静默超时), 直接告诉用户在企微 App 里手动转发.";
+        reason = "outgoing 自己发出去的媒体, 工作手机 SDK 不支持重传到图床. **直接告诉用户在企微 App 里长按图片→转发**, 不要试 resolve_media (注定失败浪费 30s+).";
+      } else if (isPicture) {
+        // SDK 对 Picture 的 DownloadFileByMsgId 几乎不响应 (实测 5/5 + Web 前端代码自承认).
+        // 不要试, 直接给用户两个能 work 的方案.
+        reason = "incoming Picture 类型. 工作手机 SDK 协议对图片 DownloadFileByMsgId 不可靠 (经常返 success=true 但 Url='', 跟 Web 前端遇到一样, 那边就弹'资源地址获取失败'). **不要试 resolve_media**. 给用户两个方案: ①企微 App 长按图→转发 (5 秒); ②如果你想要 LLM 帮发同一张图, 让用户把图发到电脑/网盘, 然后 /ai 上传一张 [URL] 发给XX (走 wework_upload 路径).";
       } else if (!url) {
-        // incoming 但 url 完全空 — 大图/原图 Java 没自动入图床. 试 resolve.
-        reason = "incoming 大图未自动入图床 (常见于原图/视频). 先用 wework_resolve_media(msgId) 触发手机 SDK 上传, 拿到 URL 再 send_media_url. 失败 (其他任务下载中=Java 繁忙→已自动重试) 退回手动转发.";
+        // 非 Picture (Voice/Video/File) 且 url 完全空
+        reason = "incoming 大文件未自动入图床. 用 wework_resolve_media(msgId) 触发手机 SDK 上传, 拿到 URL 再 send_media_url. 失败 (其他任务下载中=Java 繁忙→已自动重试) 退回手动转发.";
       } else {
-        // incoming 但 url 是 /storage/emulated/... 之类手机本地路径
+        // 非 Picture 且 url 是 /storage/emulated/... 之类手机本地路径
         reason = "incoming 媒体, URL 是手机本地路径 (公网不可下). 用 wework_resolve_media(msgId) 触发手机 SDK 上传到图床, 拿到真 URL 再 send_media_url.";
       }
     }

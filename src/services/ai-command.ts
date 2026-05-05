@@ -120,24 +120,34 @@ export function handleAiCommand(ctx: CmdContext): boolean {
    每条返回: contentType, url, msgId, forwardable, isOutgoing, thumbUrl, reason
 2. wework__wework_find_contact 找 YY 的 convId
 3. 先 wework__wework_send_message(wxId, convId, message=Y) 发文字
-4. 对每个媒体, 看 forwardable + isOutgoing 字段决策:
+4. 对每个媒体, 看 forwardable + isOutgoing + contentType 字段决策:
+
    a. forwardable=true: wework_send_media_url(wxId, convId, url, mediaType) 真发出去
       mediaType: Picture→image, Voice→voice, Video→video, File→file
-   b. forwardable=false 且 isOutgoing=true:
-      → **直接放弃 resolve_media** (工作手机 SDK 协议不支持重传 outgoing, resolve 必 60s 超时浪费时间)
-      → 老实告诉用户: "这是你自己发出去的 X, SDK 协议限制不能自动转发, 在企微 App 长按转发给YY 更快"
-   c. forwardable=false 且 isOutgoing=false (incoming 大图/视频/文件):
-      → 试 wework__wework_resolve_media(wxId, msgId, waitSec=45) 触发手机下载到图床
+
+   b. forwardable=false 且 contentType=Picture (无论 isOutgoing):
+      → **不要调 resolve_media** (SDK 协议对 Picture DownloadFileByMsgId 极不可靠,
+         实测 + Web 前端源码都承认这点 — Web 端弹"资源地址获取失败"也是这个原因)
+      → 直接 1 句话告诉用户:
+        "图片 SDK 协议限制不能自动转发, 你企微 App 里长按图→转发给YY 更快; 或者把图发到电脑后让我用 /ai 上传发"
+      → 不要写长解释, 不要列原因表, 用户只想知道"怎么办"
+
+   c. forwardable=false 且 isOutgoing=true 且不是 Picture (Voice/Video/File):
+      → **直接放弃 resolve_media** (outgoing 不能重传)
+      → 1 句话: "你自己发出去的 [Voice/Video/File] SDK 不能重传, 在企微长按转发给YY 更快"
+
+   d. forwardable=false 且 isOutgoing=false 且不是 Picture (incoming Voice/Video/File):
+      → 试 wework__wework_resolve_media(wxId, msgId) 触发手机下载到图床
       → resolve_media 内部已自动 transient 重试 (Java 报"其他任务下载中"会等几秒重试 3 次)
       → 成功就 wework_send_media_url 发
-      → 失败 (Java 永久错误 / SDK 静默超时): 老实告诉用户失败原因, 建议手动转发,
-        有 thumbUrl 可以用 send_image_url 发缩略图作为预览
+      → 失败: 1 句话告诉用户失败 + 建议手动转发, 不要长篇解释
 
 绝对不能做的事:
 - 转发媒体用 wework_send_message(发文字 URL 字符串), 接收方看到链接不是真媒体
-- 谎报"已发送"成功, resolve_media 失败时必须老实告诉用户
+- 对 Picture 类型试 wework_resolve_media (SDK 几乎必失败, 浪费 30s+ 用户等得心烦)
+- 对 isOutgoing=true 的媒体试 wework_resolve_media (同上)
 - 媒体的 url 字段是 /storage/emulated/... 手机本地路径不是公网, 永远不能直接 send
-- isOutgoing=true 的媒体不要调 resolve_media (注定失败浪费 60s)
+- 失败时长篇解释技术原因. 用户只想知道两件事: "成功还是失败" + "失败的话我现在能干啥"
 
 回复格式要求:
 - 用纯文本, 不要 markdown 表格 / 列表 / 代码块 (微信不渲染)
