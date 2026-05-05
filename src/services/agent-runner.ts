@@ -27,12 +27,39 @@ export interface ChatRequest {
   messages: Array<{
     role: "user" | "assistant" | "system";
     content: string;
-    attachments?: Array<{ type: string; url: string; name?: string }>;
+    /**
+     * 用户附件 — image/voice/video/file. 当前 Kimi 不支持 vision, 后端会把附件元信息以文本形式
+     * 拼到 user content 末尾, 让 LLM 知道用户附了什么 (例: "[用户附了图片: a.png 240KB]").
+     * dataUrl 是 base64; uploadedUrl 是远程公网 URL (如果前端已上传, 优先用).
+     */
+    attachments?: Array<{
+      type: string;
+      name?: string;
+      size?: number;
+      mimeType?: string;
+      url?: string;
+      dataUrl?: string;
+    }>;
   }>;
   llmProvider: LLMProviderConfig;
   context?: { wxId?: string; userAccount?: string };
   /** 23 个 MCP 工具的 tool schema list */
   tools: LLMTool[];
+}
+
+/** 把附件元信息渲染成文本提示, 拼到 user content 末尾喂给 LLM */
+function renderAttachmentsHint(
+  atts: NonNullable<ChatRequest["messages"][number]["attachments"]>,
+): string {
+  if (!atts.length) return "";
+  const lines = atts.map((a) => {
+    const name = a.name || "(未命名)";
+    const sizeKb = a.size ? `${Math.round(a.size / 1024)}KB` : "";
+    const mime = a.mimeType ? ` ${a.mimeType}` : "";
+    const where = a.url ? ` url=${a.url}` : a.dataUrl ? " (内嵌 base64)" : "";
+    return `[用户附了 ${a.type}: ${name}${mime}${sizeKb ? " " + sizeKb : ""}${where}]`;
+  });
+  return "\n\n" + lines.join("\n");
 }
 
 /** 确认门 — 哪些工具调用前必须等用户确认 */
@@ -78,7 +105,7 @@ function buildSystemPrompt(ctx: ChatRequest["context"]): string {
 
 ## 当前用户
 
-- 工作微信 wxId: ${ctx?.wxId ?? "1688852285335663"}
+- 工作微信 wxId: ${ctx?.wxId ?? DEFAULT_WX_ID}
 - web 账号: ${ctx?.userAccount ?? "(未知)"}
 
 ## 可用工具 (23 个 MCP)
@@ -132,6 +159,12 @@ function buildSystemPrompt(ctx: ChatRequest["context"]): string {
 - mass_send / revoke / delete 触发后端 confirm 弹窗, 你不用自己问"确认吗"`;
 }
 
+/**
+ * 兜底 wxId — 跟 agent-backend 那边对齐.
+ * 当 ChatRequest.context.wxId 没传时用 (基本不会发生, header / body 总会带一个).
+ */
+const DEFAULT_WX_ID = process.env.DEFAULT_WX_ID || "1688852285335663";
+
 /** 主入口 — 跑一次 agent loop, SSE 流式回流给前端 */
 export async function runAgent(
   req: ChatRequest,
@@ -142,7 +175,16 @@ export async function runAgent(
 ): Promise<void> {
   const messages: LLMMessage[] = [
     { role: "system", content: buildSystemPrompt(req.context) },
-    ...req.messages.map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
+    ...req.messages.map((m) => {
+      // 用户消息附件以文本形式拼到 content 末尾 (Kimi 当前无 vision, 兜底)
+      const hint = m.role === "user" && m.attachments && m.attachments.length > 0
+        ? renderAttachmentsHint(m.attachments)
+        : "";
+      return {
+        role: m.role as "user" | "assistant",
+        content: m.content + hint,
+      };
+    }),
   ];
 
   let loopCount = 0;
@@ -242,10 +284,14 @@ export async function runAgent(
         continue;
       }
 
+      // 多账号: 把 context.wxId 兜底注入 args (LLM 偶尔会漏 wxId), 同时通过 env 传给子进程
+      const ctxWxId = req.context?.wxId || DEFAULT_WX_ID;
+      if (!args.wxId) args.wxId = ctxWxId;
+
       // 执行 (spawn openclaw wework cli 子进程)
       const startMs = Date.now();
       try {
-        const out = await runMcpTool(tc.name, args);
+        const out = await runMcpTool(tc.name, args, ctxWxId);
         const elapsedMs = Date.now() - startMs;
         write("tool_call_result", { id: tc.id, result: out, elapsedMs });
         messages.push({
@@ -280,7 +326,12 @@ export async function runAgent(
  * 简化方案: 直接调 mcp-server 的 runArgs 函数 (TODO: 重构成共享的 dispatcher).
  * 当前实现一个最简映射, 覆盖核心几个; 其他先返"未实现".
  */
-async function runMcpTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+async function runMcpTool(
+  name: string,
+  args: Record<string, unknown>,
+  /** 多账号: 当前会话的 wxId, 通过 OPENCLAW_WX_ID env 传给子进程做兜底 */
+  ctxWxId?: string,
+): Promise<unknown> {
   // 把 args 映射到 CLI args (按 mcp-server.ts 的 runArgs)
   const cliArgs = mapToolToCliArgs(name, args);
   if (!cliArgs) {
@@ -299,11 +350,17 @@ async function runMcpTool(name: string, args: Record<string, unknown>): Promise<
     ? ["wework", ...cliArgs, "--json"]
     : ["wework", ...cliArgs];
 
+  // 多账号: 通过 env 把 wxId 透给子进程 (CLI 现阶段不识别 --wx-id flag, 用 env 安全).
+  // CLI 主路径还是通过 args.wxId 的位置参数传 (mapToolToCliArgs 已处理), env 是兜底.
+  const childEnv: NodeJS.ProcessEnv = { ...process.env };
+  if (ctxWxId) childEnv.OPENCLAW_WX_ID = ctxWxId;
+
   return new Promise((resolve, reject) => {
     execFile(AI_BIN, finalArgs, {
       timeout: 60_000,
       maxBuffer: 5 * 1024 * 1024,
       encoding: "utf8",
+      env: childEnv,
     }, (err, stdout, stderr) => {
       if (err) {
         reject(new Error(`${err.message}; stderr: ${(stderr ?? "").slice(0, 200)}`));

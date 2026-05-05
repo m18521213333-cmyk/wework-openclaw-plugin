@@ -17,7 +17,7 @@ import { recordPhoneStatusEvent } from "./storage-service.js";
 
 const execFileAsync = promisify(execFile);
 
-interface PhoneRow {
+export interface PhoneRow {
   wxId: string;
   name: string;
   online: boolean;
@@ -29,7 +29,7 @@ const lastState = new Map<string, { state: "online" | "offline"; sinceTs: number
 let _interval: NodeJS.Timeout | null = null;
 let _logger: { info: (m: string) => void; warn: (m: string) => void; error: (m: string) => void } | null = null;
 
-async function queryPhones(): Promise<PhoneRow[] | null> {
+export async function queryPhones(): Promise<PhoneRow[] | null> {
   const propsPath = "/opt/wework/wework-server/src/main/resources/application.properties";
   if (!fs.existsSync(propsPath)) return null;
   const props = fs.readFileSync(propsPath, "utf8");

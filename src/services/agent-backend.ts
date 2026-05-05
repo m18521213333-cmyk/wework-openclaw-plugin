@@ -19,8 +19,23 @@ import express, { type Request, type Response } from "express";
 import http from "node:http";
 import { runAgent, type ChatRequest } from "./agent-runner.js";
 import type { LLMTool, LLMProviderConfig } from "./llm-provider.js";
+import { queryPhones } from "./phone-monitor.js";
 
 const PORT = parseInt(process.env.AGENT_BACKEND_PORT ?? "17800", 10);
+
+/**
+ * 兜底 wxId — 当请求没带 X-WeWork-Account-Id header (老前端 / 直接调 curl) 时用.
+ * 多账号上线后, 前端必带 header, 这里只是降级路径.
+ */
+const DEFAULT_WX_ID = process.env.DEFAULT_WX_ID || "1688852285335663";
+
+/** 从请求头读当前操作的工作微信 wxId, 没带就用兜底 */
+function readWxId(req: { headers: Record<string, unknown> }): string {
+  const raw = req.headers["x-wework-account-id"];
+  if (typeof raw === "string" && raw.length > 0) return raw;
+  if (Array.isArray(raw) && typeof raw[0] === "string" && raw[0].length > 0) return raw[0];
+  return DEFAULT_WX_ID;
+}
 
 /** 等确认 — sessionId+confirmationId → resolver */
 const pendingConfirmations = new Map<
@@ -335,7 +350,8 @@ export function startAgentBackend(opts: {
   logger: { info: (m: string) => void; warn: (m: string) => void; error: (m: string) => void };
 }): http.Server {
   const app = express();
-  app.use(express.json({ limit: "5mb" }));
+  // 50mb 给附件 base64 留余量 (前端单文件 ≤5MB, 总 ≤5 个 → 最大 ~33MB base64)
+  app.use(express.json({ limit: "50mb" }));
   app.use((req, _res, next) => {
     opts.logger.info(`[agent] ${req.method} ${req.path}`);
     next();
@@ -346,15 +362,54 @@ export function startAgentBackend(opts: {
     res.json({ status: "ok", provider: opts.defaultProvider?.name ?? "(未配置)" });
   });
 
+  // GET /api/wework/accounts — 列出所有工作微信账号 (多账号下拉用)
+  // 数据源: Java MySQL tbl_wx_accountinfo (走 phone-monitor 的 mysql 命令).
+  // 没拿到时降级返单条兜底, 让前端起码能跑.
+  app.get("/api/wework/accounts", async (_req, res) => {
+    try {
+      const phones = await queryPhones();
+      if (!phones || phones.length === 0) {
+        // Java MySQL 拿不到 → 降级
+        res.json({
+          code: 0,
+          msg: "ok",
+          data: [
+            { wxId: DEFAULT_WX_ID, name: "孟伟@智简", isOnline: true, brand: "ZTE" },
+          ],
+        });
+        return;
+      }
+      res.json({
+        code: 0,
+        msg: "ok",
+        data: phones.map((p) => ({
+          wxId: p.wxId,
+          name: p.name || `(${p.wxId})`,
+          isOnline: p.online,
+        })),
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      opts.logger.error(`[api/wework/accounts] ${msg}`);
+      // 失败也降级, 不让前端炸
+      res.json({
+        code: 0,
+        msg: "ok",
+        data: [{ wxId: DEFAULT_WX_ID, name: "孟伟@智简", isOnline: true, brand: "ZTE" }],
+      });
+    }
+  });
+
   // ============================================
   // 列表 API — 给 web v2 菜单页用 (ContactsView / ConversationsView 等)
   // 复用 plugin 已有的 SQLite (storage-service)
   // ============================================
 
   // GET /api/contacts?wxId=&search=&limit=&offset=
+  // 多账号: 优先 X-WeWork-Account-Id header, 兼容旧 wxId query param.
   app.get("/api/contacts", async (req, res) => {
     try {
-      const wxId = String(req.query.wxId ?? "");
+      const wxId = String(req.query.wxId ?? readWxId(req as unknown as { headers: Record<string, unknown> }));
       const search = String(req.query.search ?? "");
       const limit = Math.min(parseInt(String(req.query.limit ?? "100"), 10) || 100, 500);
       const offset = parseInt(String(req.query.offset ?? "0"), 10) || 0;
@@ -389,9 +444,10 @@ export function startAgentBackend(opts: {
   });
 
   // GET /api/conversations?wxId=&limit=
+  // 多账号: 优先 X-WeWork-Account-Id header.
   app.get("/api/conversations", async (req, res) => {
     try {
-      const wxId = String(req.query.wxId ?? "");
+      const wxId = String(req.query.wxId ?? readWxId(req as unknown as { headers: Record<string, unknown> }));
       const limit = Math.min(parseInt(String(req.query.limit ?? "50"), 10) || 50, 200);
       if (!wxId) {
         res.status(400).json({ code: -1, msg: "wxId 必填" });
@@ -439,9 +495,10 @@ export function startAgentBackend(opts: {
   });
 
   // GET /api/messages?wxId=&convId=&limit=
+  // 多账号: 优先 X-WeWork-Account-Id header.
   app.get("/api/messages", async (req, res) => {
     try {
-      const wxId = String(req.query.wxId ?? "");
+      const wxId = String(req.query.wxId ?? readWxId(req as unknown as { headers: Record<string, unknown> }));
       const convId = String(req.query.convId ?? "");
       const limit = Math.min(parseInt(String(req.query.limit ?? "50"), 10) || 50, 500);
       if (!wxId || !convId) {
@@ -487,14 +544,26 @@ export function startAgentBackend(opts: {
   // GET /api/status/all — 给 StatusPanel 真用 (替换前端 mock)
   app.get("/api/status/all", async (_req, res) => {
     try {
+      // 多账号: 优先从 phone-monitor 拿真在线状态; 拿不到降级到兜底
+      let phones: Array<{ wxId: string; name: string; isOnline: boolean; brand?: string; module?: string }>;
+      try {
+        const rows = await queryPhones();
+        if (rows && rows.length > 0) {
+          phones = rows.map((r) => ({ wxId: r.wxId, name: r.name || `(${r.wxId})`, isOnline: r.online }));
+        } else {
+          throw new Error("queryPhones empty");
+        }
+      } catch {
+        phones = [
+          { wxId: DEFAULT_WX_ID, name: "孟伟@智简", isOnline: true, brand: "ZTE", module: "7531N" },
+        ];
+      }
       // 先返 mock+部分真实, 后续逐步接 health 检查
       res.json({
         code: 0,
         msg: "ok",
         data: {
-          phones: [
-            { wxId: "1688852285335663", name: "孟伟@智简", isOnline: true, brand: "ZTE", module: "7531N" },
-          ],
+          phones,
           java: { active: true, uptime: "—" },
           plugin: { active: true, pid: process.pid },
           redis: { active: true },
@@ -543,11 +612,14 @@ export function startAgentBackend(opts: {
     };
 
     try {
+      // 多账号: header 优先, 没带则 body.context.wxId, 都没有兜底.
+      const wxId = readWxId(req as unknown as { headers: Record<string, unknown> });
+      const ctx = { ...(req.body.context ?? {}), wxId };
       const chatReq: ChatRequest = {
         sessionId,
         messages: req.body.messages ?? [],
         llmProvider: opts.defaultProvider,
-        context: req.body.context ?? {},
+        context: ctx,
         tools: TOOL_SCHEMAS,
       };
       await runAgent(chatReq, write, ac.signal, awaitConfirm);
