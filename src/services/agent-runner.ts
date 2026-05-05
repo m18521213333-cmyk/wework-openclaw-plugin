@@ -229,19 +229,37 @@ async function runMcpTool(name: string, args: Record<string, unknown>): Promise<
       timeout: 60_000,
       maxBuffer: 5 * 1024 * 1024,
       encoding: "utf8",
-    }, (err, stdout) => {
+    }, (err, stdout, stderr) => {
       if (err) {
-        reject(new Error(err.message));
+        reject(new Error(`${err.message}; stderr: ${stderr?.slice(0, 200)}`));
         return;
       }
-      // CLI 输出可能含 [plugins] noise + JSON / 文本结果
-      const lines = stdout.split("\n").filter((l) => l && !l.startsWith("["));
-      const last = lines[lines.length - 1] ?? "";
+      // ⚠️ CLI 反着用: [plugins] noise 走 stdout, 实际 --json 结果走 stderr.
+      // 合并两边后按 noise 前缀过滤.
+      const combined = (stdout || "") + (stderr || "");
+      const NOISE_PREFIXES = ["[plugins]", "[ws]", "[gateway]", "[reload]", "[shutdown]", "[health-monitor]", "[diagnostic]", "[browser/server]", "[canvas]", "[heartbeat]"];
+      const lines = combined.split("\n").filter((l) => {
+        if (!l) return false;
+        return !NOISE_PREFIXES.some((p) => l.startsWith(p));
+      });
+      // 优先尝试整段 JSON parse (适合多行 array/object 输出)
+      const joined = lines.join("\n").trim();
       try {
-        resolve(JSON.parse(last));
-      } catch {
-        resolve(lines.join("\n").trim());
+        resolve(JSON.parse(joined));
+        return;
+      } catch { /* 不是 JSON 整段, 继续 */ }
+      // 再尝试找最后一行 JSON
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const t = lines[i].trim();
+        if (t.startsWith("{") || t.startsWith("[")) {
+          try {
+            resolve(JSON.parse(t));
+            return;
+          } catch { /* 不是这一行, 继续 */ }
+        }
       }
+      // fallback 文本
+      resolve(joined);
     });
   });
 }
