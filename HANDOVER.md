@@ -1,6 +1,7 @@
 # 🎁 wework-openclaw-plugin — 完整接手文档
 
-> 5/3 早 → 5/5 上午, ~30 小时, 27 个 commit, 全媒体闭环验证通过, 凭据已轮换, send 路径有重试.
+> 5/3 早 → 5/5 中午, ~32 小时, 27 commit (plugin) + 1 commit (Java 后端 feat/web-jwt-auth 分支),
+> 全媒体闭环 / 凭据轮换 / send 重试 / Web JWT 治本 全做完.
 > 任何新会话只看这份 30 秒能接上.
 
 ## ⭐ 终极形态 (今晚 5/5 凌晨实测落地)
@@ -71,6 +72,30 @@ LLM (Kimi via moonshot.cn) 自动:
 - 备份: `/root/.openclaw/openclaw.json.bak.*` + `/root/tbl_accountinfo.bak.*.sql`
 - 凭据归档: `/root/credentials.txt` (mode 600 仅 root 可读) — **抄一份到本地密码管理器**
 - 验证: 新密码 web 登录返回 token, 旧密码返回"账号或密码错误", health 全绿
+
+## 已修的 P0 安全 (5/5 中午 11:08) — Web 鉴权治本 (JWT)
+
+之前 `Constant.TOKEN = "33DD94BBF49356583E460D1FA2907EDB"` 是**所有 web 接口共用一个静态字符串**, 一泄露就全员失守. 公开仓库 / 抓包 / 代码搜都能拿到.
+
+**改造** (Java 后端 commit `e8cc347` on branch `feat/web-jwt-auth`):
+- 加 `io.jsonwebtoken:jjwt:0.9.1` 依赖
+- 新增 `framework/auth/JwtUtil.java`: HS256 签发 + 解析, claims 含 userId(sub) + account
+- `application.properties`:
+  - `jwt.secret=${JWT_SECRET:CHANGE-ME-DO-NOT-USE-IN-PROD}` (prod 用 env 覆盖, **服务器实际有 32 字节随机 secret**)
+  - `jwt.expiration-ms=604800000` (7 天)
+- `UserController.login`: 改用 `jwtUtil.generate(user.getId(), user.getAccount())`
+- `TokenInterceptor` (改 @Component): `parseQuietly()` 校验 + 401 + JSON 错误体
+- `WebConfiguration`: `@Autowired TokenInterceptor` (之前 `new TokenInterceptor()` JwtUtil 拿不到)
+
+**验证 5/5**:
+- ✅ 登录返 149 字符 JWT
+- ✅ JWT 调 /user/account/* 200
+- ✅ 老静态 token 33DD9... 401 + JSON
+- ✅ 无 token 401 + JSON
+- ✅ 篡改 JWT 401
+- ✅ plugin WS 自动重连无影响 (WS 走独立的 DeviceAuthReq, 跟 web token 是两路)
+
+**Phase 2 待办** (BCrypt 密码哈希): 当前 5 账号 password 仍是明文 24 位 alnum. 改 BCrypt 要同时改 `AccountService.login` (web 路径) + `AccountService.clientlogin` (WS 路径) + 启动时迁移现有密码, 风险更大, 单独做.
 
 ## 已修的 send 路径瞬时失败 (5/5 上午 10:30) — 重试机制
 
@@ -175,6 +200,7 @@ ssh wework-prod 'wework group 1688852285335663 create \
 
 | 时间 | bug | 修法 |
 |---|---|---|
+| **5/5 11:08** | Web 静态 token 治本 (`Constant.TOKEN` 任何人拿到都通行) | JWT 改造 (Java commit e8cc347 on feat/web-jwt-auth) |
 | **5/5 10:30** | LLM 群发 N 联系人时 send 路径瞬时失败 ("未连接 Java 后端") — 子进程 pluginbot-cli 互踢 | send-helper 加 `*WithRetry` 等重连+指数退避 (commit 2a0caeb) |
 | **5/5 09:35** | 5 个账号弱密码 `1q2w3e4r5t` (键盘对角线) | 24 位独立随机 alnum + openclaw.json 同步 |
 | **5/5 08:11** | Web /user/** 鉴权缺失 | WebConfiguration excludePathPatterns 改 /user/login |
@@ -272,7 +298,7 @@ exec env WEWORK_PLUGIN_ENABLE=1 openclaw wework "$@"
 1. ~~**LLM Agent 自然语言驱动**~~ — ✅ Kimi (moonshot.cn) 已接入, /ai 命令端到端 OK
 2. ~~**wework upload 自动连发**~~ — ✅ 已实现 `wework send-image <wxId> <convId> <localPath>`, 一条龙上传+发送
 3. **MCP 工具 spawn 子进程模型** — 当前每个 LLM 工具调用都 spawn 新的 `openclaw wework <cmd>` 子进程, 启动+auth ~6s, 序列长会有重复成本. 治本是直接走主 service 的 in-process RPC. 风险大没动, 已用 sendToJavaWithRetry band-aid 兜住瞬时失败.
-4. **Web 鉴权治本** — 当前 `Constant.TOKEN` 静态写死, 公开仓库会泄. 改 JWT + BCrypt 密码哈希 (~1-2h)
+4. ~~**Web JWT 治本**~~ — ✅ 已做 (commit e8cc347 on `feat/web-jwt-auth` 分支). **BCrypt 密码哈希 Phase 2 待办** — 要改 web + WS 两路的 login 查询, 加启动迁移, 风险更大 ~1h
 5. **Java 安全优化** — fileUpload 没大小/类型限制, CORS `Allow-Origin: *` 全开放, 待收
 6. **pending_tasks 还能扩展** — 不只用于建群+欢迎, 还可以做"加好友成功后自动打标签"等异步链
 7. **撤回 / 转发 CLI** — revoke / forward / forward-multi 命令注册了, 协议跟 send 一致, 没找到合适的 msgId 实战测
