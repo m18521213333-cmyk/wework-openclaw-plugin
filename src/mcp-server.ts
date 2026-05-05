@@ -396,6 +396,138 @@ const TOOLS = [
     },
     runArgs: (a: any) => ["recent-media", a.wxId, a.senderId, "-w", String(a.withinMinutes ?? 30), "-n", String(a.limit ?? 10), "--json"],
   },
+  // ── P2 客户操作 ──────────────────────────────────────────────────────────
+  {
+    name: "wework_add_customer",
+    description: "向指定客户发送好友申请. 用于主动拓客: 已知对方的 RemoteId 但还未添加为好友时调用. 添加后需等对方通过才能正常聊天.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string", description: "企业微信账号 wxId" },
+        remoteId: { type: "string", description: "目标客户 RemoteId" },
+        verifyContent: { type: "string", description: "好友申请验证消息, 默认 '你好'" },
+      },
+      required: ["wxId", "remoteId"],
+    },
+    runArgs: (a: any) => {
+      const args = ["add-customer", a.wxId, a.remoteId];
+      if (a.verifyContent) args.push("--verify", a.verifyContent);
+      return args;
+    },
+  },
+  {
+    name: "wework_accept_customer",
+    description: "通过客户的好友请求. 当收到新客户加好友通知 (CustomerAddNotice) 需要手动审核时调用. 自动接受已在自动化规则里配置时无需调此工具.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string", description: "企业微信账号 wxId" },
+        remoteId: { type: "string", description: "待接受客户 RemoteId" },
+      },
+      required: ["wxId", "remoteId"],
+    },
+    runArgs: (a: any) => ["accept-customer", a.wxId, a.remoteId],
+  },
+  {
+    name: "wework_get_ext_user_id",
+    description: "获取客户的企业微信外部用户ID (ExternalUserId). 用于与企微开放平台 API 对接、标签同步等需要官方 external_userid 的场景. 结果异步推送, 调后稍等片刻再查.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string", description: "企业微信账号 wxId" },
+        remoteId: { type: "string", description: "客户 RemoteId" },
+      },
+      required: ["wxId", "remoteId"],
+    },
+    runArgs: (a: any) => ["get-ext-user-id", a.wxId, a.remoteId],
+  },
+  {
+    name: "wework_set_user_memo",
+    description: "给客户设置备注 (remark). 用于给陌生客户打上便于识别的备注名, 方便后续查找. 备注只对自己可见.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string", description: "企业微信账号 wxId" },
+        remoteId: { type: "string", description: "客户 RemoteId" },
+        memo: { type: "string", description: "备注内容" },
+      },
+      required: ["wxId", "remoteId", "memo"],
+    },
+    runArgs: (a: any) => ["set-memo", a.wxId, a.remoteId, a.memo],
+  },
+  {
+    name: "wework_set_user_labels",
+    description: "给客户打标签 (覆盖写入). 标签 ID 从 web v2 LabelsView 里查看. 用于客户分类/打标/分组管理. labelIds 为空数组时清除所有标签.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string", description: "企业微信账号 wxId" },
+        remoteId: { type: "string", description: "客户 RemoteId" },
+        labelIds: { type: "array", items: { type: "string" }, description: "标签 ID 列表 (从 web v2 LabelsView 获取)" },
+      },
+      required: ["wxId", "remoteId", "labelIds"],
+    },
+    runArgs: (a: any) => ["set-user-labels", a.wxId, a.remoteId, "--label-ids", ...(a.labelIds ?? []).map(String)],
+  },
+  // ── P2 朋友圈互动 ─────────────────────────────────────────────────────────
+  {
+    name: "wework_sns_like",
+    description: "给朋友圈动态点赞. snsId 从 wework_my_moments 或朋友圈列表里获取. 只能对可见的动态点赞.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string", description: "企业微信账号 wxId" },
+        snsId: { type: "string", description: "朋友圈动态 ID" },
+      },
+      required: ["wxId", "snsId"],
+    },
+    runArgs: (a: any) => ["sns-like", a.wxId, a.snsId],
+  },
+  {
+    name: "wework_sns_comment",
+    description: "评论朋友圈动态. 可以直接评论也可以回复某条评论 (需 replyTo). 用于互动营销: 看到客户发朋友圈后及时评论维系关系.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string", description: "企业微信账号 wxId" },
+        snsId: { type: "string", description: "朋友圈动态 ID" },
+        content: { type: "string", description: "评论内容" },
+        replyTo: { type: "string", description: "(可选) 要回复的评论 ID, 不填则直接评论动态" },
+      },
+      required: ["wxId", "snsId", "content"],
+    },
+    runArgs: (a: any) => {
+      const args = ["sns-comment", a.wxId, a.snsId, a.content];
+      if (a.replyTo) args.push("--reply-to", String(a.replyTo));
+      return args;
+    },
+  },
+  {
+    name: "wework_sns_delete",
+    description: "删除自己发布的朋友圈动态. 仅能删除自己发的. 操作不可逆, 执行前需确认 snsId 正确.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string", description: "企业微信账号 wxId" },
+        snsId: { type: "string", description: "要删除的朋友圈动态 ID" },
+      },
+      required: ["wxId", "snsId"],
+    },
+    runArgs: (a: any) => ["delete-sns", a.wxId, a.snsId],
+  },
+  // ── P3 工具 ───────────────────────────────────────────────────────────────
+  {
+    name: "wework_pull_qr_code",
+    description: "拉取自己的企业微信二维码. 用于让别人扫码加好友/加企微. 结果异步推送到后端, 可在 web v2 查看.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string", description: "企业微信账号 wxId" },
+      },
+      required: ["wxId"],
+    },
+    runArgs: (a: any) => ["pull-qr-code", a.wxId],
+  },
 ];
 
 const server = new Server(

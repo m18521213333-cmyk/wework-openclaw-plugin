@@ -54,6 +54,8 @@ import {
   massSendWithRetry, postMomentsWithRetry,
   chatRoomActionWithRetry, downloadByMsgIdWithRetry,
   revokeMessageWithRetry,
+  addCustomerById, acceptCustomer, getExtUserId, setUserMemo,
+  setUserLabels, snsLike, snsComment, deleteSns, pullQrCode,
 } from "./services/send-helper.js";
 
 // node 内置: HTTP 上传 (wework upload 用)
@@ -1172,6 +1174,101 @@ export default definePluginEntry({
           console.log(`✅ 上传完成: ${up.url}`);
           const r = await sendMessageWithRetry(wxId, convId, up.url, "image");
           console.log(r.success ? `✅ 图片已发送 → ${convId}` : `❌ 发送失败: ${r.error}`);
+        }));
+
+      // --- 加好友 ---
+      ww.command("add-customer")
+        .description("发送好友请求")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<remoteId>", "目标客户 RemoteId")
+        .option("-v, --verify <content>", "验证消息", "你好")
+        .action(withConnection(async (wxId: string, remoteId: string, opts: { verify?: string }) => {
+          const r = addCustomerById(wxId, remoteId, opts.verify);
+          console.log(r.success ? `✅ 加好友请求已发送 → ${remoteId}` : `❌ ${r.error}`);
+        }));
+
+      // --- 通过好友请求 ---
+      ww.command("accept-customer")
+        .description("通过好友请求")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<remoteId>", "待接受客户 RemoteId")
+        .action(withConnection(async (wxId: string, remoteId: string) => {
+          const r = acceptCustomer(wxId, remoteId);
+          console.log(r.success ? `✅ 已通过好友请求: ${remoteId}` : `❌ ${r.error}`);
+        }));
+
+      // --- 获取外部用户ID ---
+      ww.command("get-ext-user-id")
+        .description("获取客户 external user id")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<remoteId>", "客户 RemoteId")
+        .action(withConnection(async (wxId: string, remoteId: string) => {
+          const r = getExtUserId(wxId, remoteId);
+          console.log(r.success ? `✅ 获取 ExtUserId 已发送: ${remoteId}` : `❌ ${r.error}`);
+        }));
+
+      // --- 设置备注 ---
+      ww.command("set-memo")
+        .description("设置客户备注")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<remoteId>", "客户 RemoteId")
+        .argument("<memo>", "备注内容")
+        .action(withConnection(async (wxId: string, remoteId: string, memo: string) => {
+          const r = setUserMemo(wxId, remoteId, memo);
+          console.log(r.success ? `✅ 备注已设置: ${remoteId} → "${memo}"` : `❌ ${r.error}`);
+        }));
+
+      // --- 给客户打标签 ---
+      ww.command("set-user-labels")
+        .description("给客户打标签")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<remoteId>", "客户 RemoteId")
+        .option("--label-ids <ids...>", "标签 ID 列表")
+        .action(withConnection(async (wxId: string, remoteId: string, opts: { labelIds?: string[] }) => {
+          if (!opts.labelIds?.length) { console.log("❌ 请指定 --label-ids <标签ID列表>"); return; }
+          const r = setUserLabels(wxId, remoteId, opts.labelIds);
+          console.log(r.success ? `✅ 标签已设置: ${remoteId} → [${opts.labelIds.join(",")}]` : `❌ ${r.error}`);
+        }));
+
+      // --- 朋友圈点赞 ---
+      ww.command("sns-like")
+        .description("给朋友圈动态点赞")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<snsId>", "朋友圈动态ID")
+        .action(withConnection(async (wxId: string, snsId: string) => {
+          const r = snsLike(wxId, snsId);
+          console.log(r.success ? `✅ 点赞已发送: ${snsId}` : `❌ ${r.error}`);
+        }));
+
+      // --- 朋友圈评论 ---
+      ww.command("sns-comment")
+        .description("评论朋友圈动态")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<snsId>", "朋友圈动态ID")
+        .argument("<content>", "评论内容")
+        .option("--reply-to <commentId>", "回复某条评论的ID")
+        .action(withConnection(async (wxId: string, snsId: string, content: string, opts: { replyTo?: string }) => {
+          const r = snsComment(wxId, snsId, content, opts.replyTo);
+          console.log(r.success ? `✅ 评论已发送: ${snsId}` : `❌ ${r.error}`);
+        }));
+
+      // --- 删除朋友圈 ---
+      ww.command("delete-sns")
+        .description("删除自己发的朋友圈动态")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<snsId>", "朋友圈动态ID")
+        .action(withConnection(async (wxId: string, snsId: string) => {
+          const r = deleteSns(wxId, snsId);
+          console.log(r.success ? `✅ 删除朋友圈已发送: ${snsId}` : `❌ ${r.error}`);
+        }));
+
+      // --- 拉取自己二维码 ---
+      ww.command("pull-qr-code")
+        .description("拉取自己的企业微信二维码")
+        .argument("<wxId>", "企业微信ID")
+        .action(withConnection(async (wxId: string) => {
+          const r = pullQrCode(wxId);
+          console.log(r.success ? `✅ 二维码拉取已发送: ${wxId}` : `❌ ${r.error}`);
         }));
 
     }, { commands: ["wework"] });

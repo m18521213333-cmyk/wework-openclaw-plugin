@@ -391,6 +391,35 @@ function mapToolToCliArgs(name: string, args: Record<string, unknown>): string[]
       return ["group", String(a.wxId), "add_member", "-g", String(a.convId), "-m", ...(Array.isArray(a.members) ? (a.members as string[]) : [])];
     case "wework_upload":
       return ["upload", String(a.localPath)];
+    // ── P2 客户操作 ──────────────────────────────────────────────────────
+    case "wework_add_customer": {
+      const out = ["add-customer", String(a.wxId), String(a.remoteId)];
+      if (a.verifyContent) out.push("--verify", String(a.verifyContent));
+      return out;
+    }
+    case "wework_accept_customer":
+      return ["accept-customer", String(a.wxId), String(a.remoteId)];
+    case "wework_get_ext_user_id":
+      return ["get-ext-user-id", String(a.wxId), String(a.remoteId)];
+    case "wework_set_user_memo":
+      return ["set-memo", String(a.wxId), String(a.remoteId), String(a.memo)];
+    case "wework_set_user_labels": {
+      const ids = Array.isArray(a.labelIds) ? (a.labelIds as string[]) : [];
+      return ["set-user-labels", String(a.wxId), String(a.remoteId), "--label-ids", ...ids];
+    }
+    // ── P2 朋友圈互动 ─────────────────────────────────────────────────────
+    case "wework_sns_like":
+      return ["sns-like", String(a.wxId), String(a.snsId)];
+    case "wework_sns_comment": {
+      const out = ["sns-comment", String(a.wxId), String(a.snsId), String(a.content)];
+      if (a.replyTo) out.push("--reply-to", String(a.replyTo));
+      return out;
+    }
+    case "wework_sns_delete":
+      return ["delete-sns", String(a.wxId), String(a.snsId)];
+    // ── P3 工具 ───────────────────────────────────────────────────────────
+    case "wework_pull_qr_code":
+      return ["pull-qr-code", String(a.wxId)];
     default:
       return null;
   }
