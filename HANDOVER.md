@@ -1,7 +1,8 @@
 # 🎁 wework-openclaw-plugin — 完整接手文档
 
-> 5/3 早 → 5/5 中午, ~32 小时, 27 commit (plugin) + 1 commit (Java 后端 feat/web-jwt-auth 分支),
-> 全媒体闭环 / 凭据轮换 / send 重试 / Web JWT 治本 全做完.
+> 5/3 早 → 5/5 傍晚, ~36 小时, 32 commit (plugin) + 1 commit (Java 后端).
+> 全媒体闭环 / Web 鉴权治本 (止血 + JWT) / 凭据轮换 (5 web 账号 + Kimi key) /
+> send 重试 / SDK 上传根因 (AsyncConfig) / 严格类型过滤 — 全做完.
 > 任何新会话只看这份 30 秒能接上.
 
 ## ⭐ 终极形态 (今晚 5/5 凌晨实测落地)
@@ -111,6 +112,14 @@ threadPool.setMaxPoolSize(20000);
 - 不要随便改框架默认 thread pool 大小, 即使看起来过配
 - 改 Java 后端任何 config 后必须真实负载测一遍 (我没做)
 - 5/4 那次改动**没及时回归测试**就上, 拖到 5/5 下午才发现, 浪费了大量时间 (gitee 1 个分支 + 反复重启 + 各种瞎猜)
+
+## 5/5 傍晚最后一波
+
+**SDK 全媒体上传断的真根因 (commit `7612f0b`)**: 之前我把 `AsyncConfig.java` corePool 从 10000 缩到 50 (省内存意图). 5/5 上午两次 Java 重启后 Netty 业务线程被打满, SDK 推 FriendTalkNotice 含图床上传过程的处理被阻塞队列吞掉, URL 字段保留手机本地路径. 已回退到 10000.
+
+**严格类型过滤 (commit `b2c8e22`)**: 用户说"文件" LLM 把视频也带上去了. enrichedPrompt 加规则: "图"/"音频"/"视频"/"文件" 严格按 contentType 过滤, 不贪心.
+
+**Kimi key 轮换** (5/5 17:xx, 旧 key 公开仓库会泄): 新 key 配 systemd `Environment` 三处 (MOONSHOT/KIMI/OPENAI _API_KEY), `daemon-reload + restart openclaw-scrm`. 旧 key 已在 platform.moonshot.cn revoke.
 
 ## 已修的 resolve_media 失败场景 (5/5 下午 14:43)
 
