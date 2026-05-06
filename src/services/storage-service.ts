@@ -755,6 +755,9 @@ export function findContactsByName(wxId: string, namePattern: string, limit = 10
   `).all(wxId, like, like, limit) as any[];
 
   // 2) 备用源: messages 表 (聊过的联系人, 即使没在 contacts 里)
+  // 关键过滤: conv_id = sender_id (1对1 私聊里 conv_id == 对方 remote_id == sender_id;
+  //          群聊里 conv_id 是群 ID, 不等于成员 sender_id, 必须排除否则
+  //          LLM 把 "赵丽" 解析成她所在群的 conv_id, send_message 就发到群里了!)
   const haveRemoteIds = new Set(fromContacts.map((c: any) => c.conv_id));
   const fromMessages = db.prepare(`
     SELECT
@@ -768,6 +771,9 @@ export function findContactsByName(wxId: string, namePattern: string, limit = 10
       COUNT(*)     AS msg_count
     FROM messages
     WHERE wx_id=? AND sender_name LIKE ?
+      AND conv_id = sender_id     -- 仅 1对1 私聊 (排除群)
+      AND sender_id IS NOT NULL
+      AND sender_id <> ''
     GROUP BY conv_id, sender_name
     ORDER BY MAX(created_at) DESC
     LIMIT ?

@@ -91,6 +91,9 @@ function buildSystemPrompt(ctx: ChatRequest["context"]): string {
 2. **找不到的工具或字段不存在时, 老实说"工具没返这个数据"** , 不要编.
 
 3. **不要假设 convId / remoteId**. 必须先调 wework_find_contact 拿到才用.
+   - find_contact 返回的每项有 source 字段: 'contact' (来自联系人表, 安全) / 'message' (聊天历史推断, 已过滤群).
+   - **send_message 必须用 source='contact' 的 conv_id, 这是私聊**. 不要用任何疑似群 ID.
+   - 如果 find_contact 返回多条同名 (例如 "李伟" 在多个群里有), 一定先问用户 "你说的是哪个李伟" 不要瞎选.
 
 4. **🚫 严禁改写用户原话**.
    - 用户说: "群发 X Y Z: 假期结束了" → 调 wework_mass_send 时 message="假期结束了" **完全照原文**. 不许改成 "亲爱的客户, 节后开工愉快, 期待与您再次合作" 这种润色.
