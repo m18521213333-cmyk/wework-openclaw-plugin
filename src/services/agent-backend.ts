@@ -20,7 +20,8 @@ import http from "node:http";
 import { runAgent, type ChatRequest } from "./agent-runner.js";
 import type { LLMTool, LLMProviderConfig } from "./llm-provider.js";
 import { queryPhones } from "./phone-monitor.js";
-import { renameConversation } from "./storage-service.js";
+import { renameConversation, getQrcode } from "./storage-service.js";
+import { pullQrCode } from "./send-helper.js";
 import { healthEvents, type HealthEvent } from "./health-events.js";
 
 const PORT = parseInt(process.env.AGENT_BACKEND_PORT ?? "17800", 10);
@@ -399,6 +400,56 @@ export function startAgentBackend(opts: {
         msg: "ok",
         data: [{ wxId: DEFAULT_WX_ID, name: "孟伟@智简", isOnline: true, brand: "ZTE" }],
       });
+    }
+  });
+
+  // GET /api/wework/qrcode?wxId=xxx — 拉当前账号 (或指定 wxId) 的二维码
+  // 流程:
+  //   1) 发 PullMyQrCodeTask 到 Java (send-helper, fire-and-forget)
+  //   2) await ~3s 等 Java 通过 WS 推 PullMyQrCodeTaskResultNotice 进来
+  //      (index.ts json-message handler 把 url 写到 SQLite qrcodes 表)
+  //   3) 读 SQLite, 有 url/base64 就 200 + data, 没有就 code:-1 让前端走 catch
+  // 注: 为什么不直接同步等 Java 回 — Java/SDK 异步, 我们是 fire-and-forget 模式,
+  //     跟 moments 一样靠 WS push 落库 + HTTP 路由 polling 取.
+  app.get("/api/wework/qrcode", async (req, res) => {
+    try {
+      const wxId = String(req.query.wxId ?? readWxId(req as unknown as { headers: Record<string, unknown> }));
+      if (!wxId) {
+        res.status(400).json({ code: -1, msg: "wxId 必填" });
+        return;
+      }
+
+      // 触发 Java 拉新二维码 — pullQrCode 内部走 sendToJava (WS 协议帧)
+      const sendResult = pullQrCode(wxId);
+      if (!sendResult.success) {
+        opts.logger.warn(`[api/wework/qrcode] pullQrCode 发送失败 wxId=${wxId}: ${sendResult.error}`);
+        // 发送失败不直接 fail — 仍尝试读 SQLite (可能有上次拉到的旧数据)
+      }
+
+      // 等 Java 异步推回结果, 实测正常路径 1~2s, 给 3s 余量
+      await new Promise<void>((r) => setTimeout(r, 3000));
+
+      // 读 SQLite (WS handler 写入)
+      const row = getQrcode(wxId);
+      if (row && (row.qr_url || row.qr_base64)) {
+        res.json({
+          code: 0,
+          msg: "ok",
+          data: {
+            url: row.qr_url ?? "",
+            base64: row.qr_base64 ?? "",
+            expireAt: row.expire_at ?? null,
+          },
+        });
+        return;
+      }
+
+      // 没拉到 — 返 code:-1, 前端 axios 拦截器会 reject, SettingsView 显示 msg
+      res.json({ code: -1, msg: "二维码暂未拉到, 请稍后再试" });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      opts.logger.error(`[api/wework/qrcode] ${msg}`);
+      res.status(500).json({ code: -1, msg });
     }
   });
 

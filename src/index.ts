@@ -41,7 +41,7 @@ import { startAgentBackend } from "./services/agent-backend.js";
 import type { LLMProviderConfig } from "./services/llm-provider.js";
 import type { Server as HttpServer } from "node:http";
 import { handleAiCommand } from "./services/ai-command.js";
-import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getResolvedMediaStatus, clearResolvedMediaRecord, isTransientResolveError, getMessageMeta, upsertMoment, listMoments } from "./services/storage-service.js";
+import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getResolvedMediaStatus, clearResolvedMediaRecord, isTransientResolveError, getMessageMeta, upsertMoment, listMoments, getMomentBySnsId, upsertMomentsTask, listMomentsTasks, upsertQrcode } from "./services/storage-service.js";
 
 // send-helper (CLI 直接调用)
 // 子进程模式下 Java pluginbot-cli 经常被互踢, 所有 send 路径都走 withRetry 版.
@@ -57,6 +57,7 @@ import {
   revokeMessageWithRetry,
   addCustomerById, acceptCustomer, getExtUserId, setUserMemo,
   setUserLabels, snsLike, snsComment, deleteSns, pullQrCode,
+  getSnsData, pullSnsTaskList,
 } from "./services/send-helper.js";
 
 // node 内置: HTTP 上传 (wework upload 用)
@@ -329,6 +330,78 @@ export default definePluginEntry({
                   saved++;
                 }
                 logger.info(`[Moments] ${msgType} 落库 ${saved} 条 (wxId=${wxId})`);
+              }
+            }
+
+            // 管理员朋友圈任务列表 → 落 SQLite moments_tasks 表
+            // 解决 fire-and-forget: tool/CLI 发完 PullSnsTaskListTask 立即拿不到数据,
+            // 这里 WS push 进来后写库, tool/CLI 等几秒再读 SQLite 拿到.
+            // 字段映射 (proto WPullSnsTaskListTaskResultNotice):
+            //   PullSnsTaskListTaskResultNoticeMessage:
+            //     WxId int64 / Success bool / ErrMsg / TaskList: SnsTaskMessage[]
+            //   SnsTaskMessage:
+            //     Author int64 / SnsInfo: SnsInfoMessage / Posted bool
+            if (msgType === "PullSnsTaskListTaskResultNotice") {
+              const wxId = String(content.WxId ?? (content as any).wxId ?? "");
+              const success = (content.Success ?? (content as any).success) !== false;
+              if (!success) {
+                const err = content.ErrMsg ?? (content as any).errMsg;
+                logger.warn(`[MomentsTask] ${msgType} 失败: ${err}`);
+              } else {
+                const list = (content.TaskList ?? (content as any).taskList ?? []) as any[];
+                let saved = 0;
+                for (const task of list) {
+                  if (!task) continue;
+                  const author = String(task.Author ?? task.author ?? "");
+                  const sns = task.SnsInfo ?? task.snsInfo;
+                  if (!sns) continue;
+                  const snsId = String(sns.SnsId ?? sns.snsId ?? "");
+                  if (!snsId || snsId === "0") continue;
+                  const tRaw = sns.Time ?? sns.time;
+                  const postAt = typeof tRaw === "number" ? tRaw
+                    : typeof tRaw === "string" ? Number(tRaw) || null
+                    : null;
+                  const images = (sns.Images ?? sns.images ?? []) as any[];
+                  const imageUrls = images.map((img: any) => ({
+                    url: String(img?.Url ?? img?.url ?? ""),
+                    thumbUrl: img?.ThumbImg ?? img?.thumbImg ?? undefined,
+                  })).filter((i) => i.url);
+                  const posted = !!(task.Posted ?? task.posted);
+                  upsertMomentsTask({
+                    wxId,
+                    snsId,
+                    author: author || null,
+                    content: (sns.Content ?? sns.content ?? null) as string | null,
+                    imageUrls,
+                    postAt,
+                    posted,
+                    rawJson: JSON.stringify(task),
+                  });
+                  saved++;
+                }
+                logger.info(`[MomentsTask] ${msgType} 落库 ${saved} 条 (wxId=${wxId})`);
+              }
+            }
+
+            // 我的二维码拉取结果 → 落 SQLite qrcodes 表
+            // 字段映射 (proto WPullMyQrCodeTaskResultNotice):
+            //   WxId int64 / Success bool / ErrMsg string / Url string
+            // 注: proto 里没有 base64 / expireTime — 当前只能落 url, 其他字段留 null.
+            // 解决 fire-and-forget: HTTP /api/wework/qrcode 触发 Task → 等几秒 → 读 SQLite.
+            if (msgType === "PullMyQrCodeTaskResultNotice") {
+              const wxId = String(content.WxId ?? (content as any).wxId ?? "");
+              const success = (content.Success ?? (content as any).success) !== false;
+              if (!success) {
+                const err = content.ErrMsg ?? (content as any).errMsg;
+                logger.warn(`[QrCode] ${msgType} 失败 (wxId=${wxId}): ${err}`);
+              } else {
+                const url = String(content.Url ?? (content as any).url ?? "");
+                if (wxId && url) {
+                  upsertQrcode(wxId, url, null, null);
+                  logger.info(`[QrCode] ${msgType} 落库 wxId=${wxId} url=${url.slice(0, 80)}`);
+                } else {
+                  logger.warn(`[QrCode] ${msgType} 字段为空 wxId="${wxId}" url="${url}"`);
+                }
               }
             }
 
@@ -1172,6 +1245,99 @@ export default definePluginEntry({
             const ts = row.post_at ? new Date(row.post_at * 1000).toISOString() : "未知时间";
             const snippet = (row.content ?? "").replace(/\n/g, " ").slice(0, 80);
             console.log(`  [${ts}] snsId=${row.sns_id}  ${snippet}`);
+          }
+        }));
+
+      // --- 拉取单条朋友圈详情 ---
+      // 同 my-moments: CLI 子进程发查询指令 → 等 3s → 读 SQLite (plugin server 写入)
+      ww.command("sns-data")
+        .description("拉取单条朋友圈详情 (先发查询, 等 3s 让 plugin server 入库, 再读 SQLite)")
+        .argument("<wxId>", "企业微信ID")
+        .argument("<snsId>", "朋友圈动态ID")
+        .option("--json", "JSON 输出")
+        .action(withConnection(async (wxId: string, snsId: string, opts: { json?: boolean }) => {
+          const r = getSnsData(wxId, snsId);
+          if (!r.success && !opts.json) {
+            console.log(`❌ 查询指令发送失败: ${r.error}`);
+          }
+          await new Promise((rr) => setTimeout(rr, 3000));
+          const row = getMomentBySnsId(snsId);
+          if (opts.json) {
+            if (!row) {
+              console.log(JSON.stringify({ refreshOk: r.success, found: false }));
+              return;
+            }
+            let images: Array<{ url: string; thumbUrl?: string }> = [];
+            try { images = row.image_urls ? JSON.parse(row.image_urls) : []; } catch { /* ignore */ }
+            let raw: any = null;
+            try { raw = row.raw_json ? JSON.parse(row.raw_json) : null; } catch { /* ignore */ }
+            console.log(JSON.stringify({
+              refreshOk: r.success,
+              found: true,
+              snsId: row.sns_id,
+              wxId: row.wx_id,
+              content: row.content,
+              imageUrls: images,
+              postAt: row.post_at,
+              comments: raw?.Comments ?? raw?.comments ?? [],
+              likes: raw?.Likes ?? raw?.likes ?? [],
+              link: raw?.Link ?? raw?.link ?? null,
+              video: raw?.Video ?? raw?.video ?? null,
+            }, null, 2));
+            return;
+          }
+          if (!row) {
+            console.log("(暂无该朋友圈数据 — 可能首次拉取 plugin server 还没回写, 重试一次; 或 sns_id 不存在)");
+            return;
+          }
+          const ts = row.post_at ? new Date(row.post_at * 1000).toISOString() : "未知时间";
+          const snippet = (row.content ?? "").replace(/\n/g, " ").slice(0, 200);
+          console.log(`[${ts}] snsId=${row.sns_id}  ${snippet}`);
+        }));
+
+      // --- 拉取管理员朋友圈任务列表 ---
+      ww.command("sns-task-list")
+        .description("拉取管理员朋友圈任务列表 (先发拉取, 等 3s 让 plugin server 入库, 再读 SQLite)")
+        .argument("<wxId>", "企业微信ID")
+        .option("-n, --limit <n>", "条数, 默认 50", "50")
+        .option("--json", "JSON 输出")
+        .action(withConnection(async (wxId: string, opts: { limit: string; json?: boolean }) => {
+          const limit = parseInt(opts.limit, 10) || 50;
+          const r = pullSnsTaskList(wxId);
+          if (!r.success && !opts.json) {
+            console.log(`❌ 拉取指令发送失败: ${r.error}`);
+          }
+          await new Promise((rr) => setTimeout(rr, 3000));
+          const list = listMomentsTasks(wxId, limit);
+          if (opts.json) {
+            console.log(JSON.stringify({
+              refreshOk: r.success,
+              refreshError: r.success ? undefined : r.error,
+              count: list.length,
+              items: list.map((row) => {
+                let images: Array<{ url: string; thumbUrl?: string }> = [];
+                try { images = row.image_urls ? JSON.parse(row.image_urls) : []; } catch { /* ignore */ }
+                return {
+                  snsId: row.sns_id,
+                  author: row.author,
+                  content: row.content,
+                  imageUrls: images,
+                  postAt: row.post_at,
+                  posted: !!row.posted,
+                };
+              }),
+            }, null, 2));
+            return;
+          }
+          if (list.length === 0) {
+            console.log("(暂无管理员朋友圈任务 — 可能首次拉取 plugin server 还没回写; 或 plugin server 没在跑)");
+            return;
+          }
+          for (const row of list) {
+            const ts = row.post_at ? new Date(row.post_at * 1000).toISOString() : "未知时间";
+            const flag = row.posted ? "[已发表]" : "[未发表]";
+            const snippet = (row.content ?? "").replace(/\n/g, " ").slice(0, 80);
+            console.log(`  ${flag} [${ts}] snsId=${row.sns_id}  ${snippet}`);
           }
         }));
 

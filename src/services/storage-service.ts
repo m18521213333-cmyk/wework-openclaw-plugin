@@ -213,6 +213,35 @@ function initTables(db: Database.Database): void {
       PRIMARY KEY (wx_id, sns_id)
     );
     CREATE INDEX IF NOT EXISTS idx_moments_wxid_post ON moments(wx_id, post_at);
+
+    -- 管理员朋友圈任务列表 (跨进程: service 监听 PullSnsTaskListTaskResultNotice 写,
+    -- tool/CLI 读). 解决 fire-and-forget WS 调用 LLM 拿不到任务列表的问题.
+    -- 主键 (wx_id, sns_id): 任务里实际承载的是 SnsInfo, sns_id 同样唯一; posted=true/false 标记
+    -- 任务是否已经发表过. 没 sns_id 的兜底用 author + pulled_at 伪 id (非常极端情况).
+    CREATE TABLE IF NOT EXISTS moments_tasks (
+      wx_id TEXT NOT NULL,
+      sns_id TEXT NOT NULL,                -- 任务里 SnsInfo.SnsId (int64 字符串)
+      author TEXT,                          -- SnsTaskMessage.Author (int64 字符串)
+      content TEXT,                         -- 任务文案 (= SnsInfo.Content)
+      image_urls TEXT,                      -- JSON 数组: [{url, thumbUrl}]
+      post_at INTEGER,                      -- 任务里 SnsInfo.Time
+      posted INTEGER NOT NULL DEFAULT 0,    -- 是否已发表 (proto Posted bool)
+      raw_json TEXT,                        -- 完整原始 SnsTaskMessage JSON
+      pulled_at INTEGER NOT NULL,           -- 入库 unix 毫秒
+      PRIMARY KEY (wx_id, sns_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_moments_tasks_wxid_pulled ON moments_tasks(wx_id, pulled_at);
+
+    -- 我的二维码缓存 (跨进程: service 进程监听 PullMyQrCodeTaskResultNotice 写,
+    -- HTTP 路由 /api/wework/qrcode 读). PRIMARY KEY (wx_id) — 每个工作微信只存最新一条.
+    -- 注: 当前 proto 只有 Url 字段, base64 / expire_at 预留给 SDK 升级.
+    CREATE TABLE IF NOT EXISTS qrcodes (
+      wx_id TEXT PRIMARY KEY,
+      qr_url TEXT,                       -- 二维码图片 URL (proto Url)
+      qr_base64 TEXT,                    -- base64 (优先) — 当前 proto 没回, 一般为空
+      expire_at INTEGER,                 -- 过期 unix 秒 — 当前 proto 没回, 一般为空
+      pulled_at INTEGER NOT NULL          -- 落库 unix 毫秒
+    );
   `);
 
   // 兼容: 老库可能已有同名表但缺 nick 字段 → 加列. 失败 (字段已存在) 静默忽略.
@@ -293,6 +322,146 @@ export function listMoments(wxId: string, limit: number = 20): Array<{
     raw_json: string | null;
     pulled_at: number;
   }>;
+}
+
+/**
+ * 按 sns_id 读单条朋友圈 (用于 wework_get_sns_detail: 发送指令 → await → SELECT).
+ * 不限 wx_id (返回 wx_id 字段供调用方校验), 因为 GetSnsDataTaskResultNotice 的 WxId
+ * 可能跟原始查询的 WxId 略有差异 (例如查别人的圈), Agent N 当前 handler 已统一兜底
+ * 用 SnsInfo.Author 作为 wxId 写入.
+ */
+export function getMomentBySnsId(snsId: string): {
+  wx_id: string;
+  sns_id: string;
+  content: string | null;
+  image_urls: string | null;
+  post_at: number | null;
+  raw_json: string | null;
+  pulled_at: number;
+} | null {
+  if (!snsId) return null;
+  const db = getDb();
+  return (db.prepare(`
+    SELECT wx_id, sns_id, content, image_urls, post_at, raw_json, pulled_at
+    FROM moments
+    WHERE sns_id = ?
+    ORDER BY pulled_at DESC
+    LIMIT 1
+  `).get(snsId) ?? null) as any;
+}
+
+// ============================================
+// 管理员朋友圈任务缓存 (跨进程: service 监听 PullSnsTaskListTaskResultNotice 写)
+// ============================================
+
+export interface MomentsTaskRecord {
+  wxId: string;
+  snsId: string;
+  author: string | null;
+  content: string | null;
+  /** 图片 URL 列表 */
+  imageUrls: Array<{ url: string; thumbUrl?: string }>;
+  postAt: number | null;
+  posted: boolean;
+  /** 完整原始 SnsTaskMessage (JSON 序列化) */
+  rawJson: string | null;
+}
+
+/** 写入或覆盖一条管理员朋友圈任务 (按 wx_id + sns_id 唯一) */
+export function upsertMomentsTask(t: MomentsTaskRecord): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO moments_tasks (wx_id, sns_id, author, content, image_urls, post_at, posted, raw_json, pulled_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(wx_id, sns_id) DO UPDATE SET
+      author     = excluded.author,
+      content    = excluded.content,
+      image_urls = excluded.image_urls,
+      post_at    = excluded.post_at,
+      posted     = excluded.posted,
+      raw_json   = excluded.raw_json,
+      pulled_at  = excluded.pulled_at
+  `).run(
+    t.wxId,
+    t.snsId,
+    t.author,
+    t.content,
+    JSON.stringify(t.imageUrls ?? []),
+    t.postAt,
+    t.posted ? 1 : 0,
+    t.rawJson,
+    Date.now(),
+  );
+}
+
+/** 读取某 wxId 的朋友圈任务列表, 按入库时间倒序. */
+export function listMomentsTasks(wxId: string, limit: number = 50): Array<{
+  wx_id: string;
+  sns_id: string;
+  author: string | null;
+  content: string | null;
+  image_urls: string | null;
+  post_at: number | null;
+  posted: number;
+  raw_json: string | null;
+  pulled_at: number;
+}> {
+  const db = getDb();
+  return db.prepare(`
+    SELECT wx_id, sns_id, author, content, image_urls, post_at, posted, raw_json, pulled_at
+    FROM moments_tasks
+    WHERE wx_id = ?
+    ORDER BY pulled_at DESC
+    LIMIT ?
+  `).all(wxId, limit) as any;
+}
+
+// ============================================
+// 我的二维码缓存 (跨进程: service 监听 PullMyQrCodeTaskResultNotice 写,
+// HTTP 路由 /api/wework/qrcode 读)
+// ============================================
+
+export interface QrCodeRow {
+  wx_id: string;
+  qr_url: string | null;
+  qr_base64: string | null;
+  expire_at: number | null;
+  pulled_at: number;
+}
+
+/**
+ * 写入或覆盖某 wxId 的最新二维码记录.
+ * @param url       proto Url 字段 (二维码图片 URL)
+ * @param base64    SDK 升级后才可能有, 当前留 null
+ * @param expireAt  unix 秒, 当前 proto 没回, 留 null
+ */
+export function upsertQrcode(
+  wxId: string,
+  url: string | null,
+  base64: string | null,
+  expireAt: number | null,
+): void {
+  if (!wxId) return;
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO qrcodes (wx_id, qr_url, qr_base64, expire_at, pulled_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(wx_id) DO UPDATE SET
+      qr_url    = excluded.qr_url,
+      qr_base64 = excluded.qr_base64,
+      expire_at = excluded.expire_at,
+      pulled_at = excluded.pulled_at
+  `).run(wxId, url ?? null, base64 ?? null, expireAt ?? null, Date.now());
+}
+
+/** 读最新二维码 (没拉到过返 null). */
+export function getQrcode(wxId: string): QrCodeRow | null {
+  if (!wxId) return null;
+  const db = getDb();
+  const row = db.prepare(
+    "SELECT wx_id, qr_url, qr_base64, expire_at, pulled_at FROM qrcodes WHERE wx_id = ?",
+  ).get(wxId);
+  return (row ?? null) as QrCodeRow | null;
 }
 
 // ============================================

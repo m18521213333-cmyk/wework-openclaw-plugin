@@ -27,7 +27,7 @@ import {
   deleteSnsComment,
 } from "../services/send-helper.js";
 import type { SendResult } from "../services/send-helper.js";
-import { listMoments } from "../services/storage-service.js";
+import { listMoments, getMomentBySnsId, listMomentsTasks } from "../services/storage-service.js";
 import { makeTool, type ToolResult } from "../openclaw-compat.js";
 
 function toResult(r: SendResult, ok: string): ToolResult {
@@ -107,18 +107,57 @@ export function registerMomentsTools(api: OpenClawPluginApi) {
 
   // --------------------------------------------------
   // 6.2a 获取单条朋友圈详情
-  // 原逻辑: GetSnsDataTaskMessage → msgSend2Phone
+  // 原逻辑: GetSnsDataTaskMessage → msgSend2Phone (异步) +
+  //         WS push GetSnsDataTaskResultNotice 落 SQLite moments 表 +
+  //         这里 await 后从 SQLite 读 sns_id 对应记录
+  // 局限: 子进程 CLI 自己没 WS receive 端, 实际入库由 plugin server 进程完成.
+  //       plugin server 离线时拿不到新数据 (后续可换 EventEmitter).
   // --------------------------------------------------
   api.registerTool(makeTool({
     name: "wework_get_sns_detail",
-    description: "获取指定朋友圈动态的详情（内容、评论、点赞等）",
+    description: "获取指定朋友圈动态的详情 (先发查询指令, 等 3s 让 WS push 入 SQLite, 再返回 sns_id 对应的最新记录)",
     parameters: Type.Object({
       wxId: Type.String({ description: "企业微信ID" }),
       snsId: Type.String({ description: "朋友圈动态ID" }),
     }),
     async execute(_id, params) {
-      const r = getSnsData(params.wxId, params.snsId);
-      return toResult(r, `朋友圈详情查询已发送: snsId=${params.snsId}`);
+      // 1) 先发查询指令 (fire-and-forget; 由 plugin server 进程接 push 入 SQLite)
+      const trig = getSnsData(params.wxId, params.snsId);
+      // 2) 粗略等 3 秒让 WS push 写库
+      await new Promise((r) => setTimeout(r, 3000));
+      // 3) 读 SQLite 拿这条 sns_id 的详情
+      const row = getMomentBySnsId(params.snsId);
+      if (!row) {
+        const tail = trig.success
+          ? "暂无该朋友圈数据 (可能首次拉取还没回来, 重试一次; 或 sns_id 不属于该 wxId)"
+          : `暂无该朋友圈数据, 且查询指令发送失败: ${trig.error}`;
+        return {
+          content: [{ type: "text" as const, text: tail }],
+          details: {},
+          isError: !trig.success,
+        };
+      }
+      let images: Array<{ url: string; thumbUrl?: string }> = [];
+      try { images = row.image_urls ? JSON.parse(row.image_urls) : []; } catch { /* ignore */ }
+      // raw_json 里有完整的 SnsInfo (含评论/点赞/视频/链接), 一并返回
+      let raw: any = null;
+      try { raw = row.raw_json ? JSON.parse(row.raw_json) : null; } catch { /* ignore */ }
+      const view = {
+        snsId: row.sns_id,
+        wxId: row.wx_id,
+        content: row.content,
+        imageUrls: images,
+        postAt: row.post_at,
+        comments: raw?.Comments ?? raw?.comments ?? [],
+        likes: raw?.Likes ?? raw?.likes ?? [],
+        link: raw?.Link ?? raw?.link ?? null,
+        video: raw?.Video ?? raw?.video ?? null,
+      };
+      const header = `朋友圈详情 (refreshOk=${trig.success}):\n`;
+      return {
+        content: [{ type: "text" as const, text: header + JSON.stringify(view, null, 2) }],
+        details: {},
+      };
     },
   }));
 
@@ -172,17 +211,50 @@ export function registerMomentsTools(api: OpenClawPluginApi) {
 
   // --------------------------------------------------
   // 6.2c 拉取管理员朋友圈任务列表
-  // 原逻辑: PullSnsTaskListTaskMessage → msgSend2Phone
+  // 原逻辑: PullSnsTaskListTaskMessage → msgSend2Phone (异步) +
+  //         WS push PullSnsTaskListTaskResultNotice 落 SQLite moments_tasks 表 +
+  //         这里 await 后从 SQLite 读最新 50 条
+  // 局限同 wework_get_my_moments — 实际入库依赖 plugin server 进程.
   // --------------------------------------------------
   api.registerTool(makeTool({
     name: "wework_get_moments_tasks",
-    description: "获取企业管理员下发的朋友圈任务列表，结果通过事件异步返回",
+    description: "获取企业管理员下发的朋友圈任务列表 (先发拉取指令, 等 3s 让 WS push 入 SQLite, 再返回最新 50 条)",
     parameters: Type.Object({
       wxId: Type.String({ description: "企业微信ID" }),
     }),
     async execute(_id, params) {
-      const r = pullSnsTaskList(params.wxId);
-      return toResult(r, "管理员朋友圈任务列表拉取指令已发送");
+      // 1) 先发拉取指令 (fire-and-forget; 由 plugin server 进程接 push 入 SQLite)
+      const trig = pullSnsTaskList(params.wxId);
+      // 2) 粗略等 3 秒让 WS push 写库
+      await new Promise((r) => setTimeout(r, 3000));
+      // 3) 读 SQLite (即使触发失败, 老缓存还能用)
+      const rows = listMomentsTasks(params.wxId, 50);
+      if (rows.length === 0) {
+        const tail = trig.success
+          ? "暂无管理员朋友圈任务 (可能首次拉取还没回来, 重试一次)"
+          : `暂无管理员朋友圈任务, 且拉取指令发送失败: ${trig.error}`;
+        return {
+          content: [{ type: "text" as const, text: tail }],
+          details: {},
+        };
+      }
+      const view = rows.map((r) => {
+        let images: Array<{ url: string; thumbUrl?: string }> = [];
+        try { images = r.image_urls ? JSON.parse(r.image_urls) : []; } catch { /* ignore */ }
+        return {
+          snsId: r.sns_id,
+          author: r.author,
+          content: r.content,
+          imageUrls: images,
+          postAt: r.post_at,
+          posted: !!r.posted,
+        };
+      });
+      const header = `共 ${rows.length} 条朋友圈任务 (refreshOk=${trig.success}):\n`;
+      return {
+        content: [{ type: "text" as const, text: header + JSON.stringify(view, null, 2) }],
+        details: {},
+      };
     },
   }));
 

@@ -264,7 +264,33 @@ const TOOLS = [
       properties: { wxId: { type: "string" } },
       required: ["wxId"],
     },
-    runArgs: (a: any) => ["my-moments", a.wxId],
+    runArgs: (a: any) => ["my-moments", a.wxId, "--json"],
+  },
+  {
+    name: "wework_get_sns_detail",
+    description: "拉取单条朋友圈详情 (内容/评论/点赞/视频/链接). 内部走 await pattern: 发查询指令 → 等 3s 让 plugin server 入库 → 读 SQLite.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string" },
+        snsId: { type: "string", description: "朋友圈动态 ID (例从 wework_my_moments 返回拿)" },
+      },
+      required: ["wxId", "snsId"],
+    },
+    runArgs: (a: any) => ["sns-data", a.wxId, a.snsId, "--json"],
+  },
+  {
+    name: "wework_get_moments_tasks",
+    description: "拉取企业管理员下发的朋友圈任务列表 (走 await pattern, 内部入库 plugin server 进程).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        wxId: { type: "string" },
+        limit: { type: "number", description: "最多几条, 默认 50", default: 50 },
+      },
+      required: ["wxId"],
+    },
+    runArgs: (a: any) => ["sns-task-list", a.wxId, "-n", String(a.limit ?? 50), "--json"],
   },
   {
     name: "wework_sync_data",
