@@ -198,6 +198,21 @@ function initTables(db: Database.Database): void {
       updated_at TEXT DEFAULT (datetime('now')),
       PRIMARY KEY (wx_id, conv_id)
     );
+
+    -- 朋友圈缓存 (跨进程: service 监听 PullMySnsListTaskResultNotice / GetSnsDataTaskResultNotice
+    -- 写, tool/CLI 读). 解决 fire-and-forget WS 调用 LLM 拿不到数据的问题.
+    -- 主键 (wx_id, sns_id): 同一条 sns_id 重新拉到时 upsert 覆盖 (评论/点赞会变化).
+    CREATE TABLE IF NOT EXISTS moments (
+      wx_id TEXT NOT NULL,
+      sns_id TEXT NOT NULL,
+      content TEXT,                       -- 朋友圈文案
+      image_urls TEXT,                    -- JSON 数组: [{url, thumbUrl}, ...]
+      post_at INTEGER,                    -- 发布时间 unix 秒
+      raw_json TEXT,                      -- 完整原始 SnsInfo JSON (含 Comments/Likes/Video/Link 等)
+      pulled_at INTEGER NOT NULL,         -- 入库 unix 毫秒
+      PRIMARY KEY (wx_id, sns_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_moments_wxid_post ON moments(wx_id, post_at);
   `);
 
   // 兼容: 老库可能已有同名表但缺 nick 字段 → 加列. 失败 (字段已存在) 静默忽略.
@@ -208,6 +223,76 @@ function initTables(db: Database.Database): void {
       db.exec(`ALTER TABLE conversations ADD COLUMN nick TEXT`);
     }
   } catch { /* ignore */ }
+}
+
+// ============================================
+// 朋友圈缓存 (跨进程: service 进程监听 WS push 写, CLI/tool 子进程读)
+// ============================================
+
+export interface MomentRecord {
+  wxId: string;
+  snsId: string;
+  content: string | null;
+  /** 图片 URL 列表, 每项含 url + 可能的 thumbUrl */
+  imageUrls: Array<{ url: string; thumbUrl?: string }>;
+  /** 发布时间 unix 秒 (proto SnsInfo.Time) */
+  postAt: number | null;
+  /** 完整原始 SnsInfo (经 Java JSON 序列化) — 包含评论/点赞/视频/链接等 */
+  rawJson: string | null;
+}
+
+/** 写入或覆盖一条朋友圈记录 (按 wx_id + sns_id 唯一) */
+export function upsertMoment(m: MomentRecord): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO moments (wx_id, sns_id, content, image_urls, post_at, raw_json, pulled_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(wx_id, sns_id) DO UPDATE SET
+      content    = excluded.content,
+      image_urls = excluded.image_urls,
+      post_at    = excluded.post_at,
+      raw_json   = excluded.raw_json,
+      pulled_at  = excluded.pulled_at
+  `).run(
+    m.wxId,
+    m.snsId,
+    m.content,
+    JSON.stringify(m.imageUrls ?? []),
+    m.postAt,
+    m.rawJson,
+    Date.now(),
+  );
+}
+
+/**
+ * 读取某个 wxId 的朋友圈, 按发布时间倒序.
+ * post_at NULL 的会被排到最后 (NULLS LAST 等价写法).
+ */
+export function listMoments(wxId: string, limit: number = 20): Array<{
+  wx_id: string;
+  sns_id: string;
+  content: string | null;
+  image_urls: string | null;
+  post_at: number | null;
+  raw_json: string | null;
+  pulled_at: number;
+}> {
+  const db = getDb();
+  return db.prepare(`
+    SELECT wx_id, sns_id, content, image_urls, post_at, raw_json, pulled_at
+    FROM moments
+    WHERE wx_id = ?
+    ORDER BY (post_at IS NULL), post_at DESC, pulled_at DESC
+    LIMIT ?
+  `).all(wxId, limit) as Array<{
+    wx_id: string;
+    sns_id: string;
+    content: string | null;
+    image_urls: string | null;
+    post_at: number | null;
+    raw_json: string | null;
+    pulled_at: number;
+  }>;
 }
 
 // ============================================

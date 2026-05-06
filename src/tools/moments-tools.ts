@@ -27,6 +27,7 @@ import {
   deleteSnsComment,
 } from "../services/send-helper.js";
 import type { SendResult } from "../services/send-helper.js";
+import { listMoments } from "../services/storage-service.js";
 import { makeTool, type ToolResult } from "../openclaw-compat.js";
 
 function toResult(r: SendResult, ok: string): ToolResult {
@@ -123,17 +124,49 @@ export function registerMomentsTools(api: OpenClawPluginApi) {
 
   // --------------------------------------------------
   // 6.2b 拉取自己的朋友圈列表
-  // 原逻辑: PullMySnsListTaskMessage → msgSend2Phone
+  // 原逻辑: PullMySnsListTaskMessage → msgSend2Phone (异步) +
+  //         WS push PullMySnsListTaskResultNotice 落 SQLite moments 表 +
+  //         这里 await 后从 SQLite 读最新 20 条
+  // 局限: 子进程 CLI 自己没有 WS receive 端, 实际入库由 plugin server (开常驻 WS
+  //       的那个) 完成. plugin server 离线时拿不到新数据 (TODO: 后续可换 EventEmitter).
   // --------------------------------------------------
   api.registerTool(makeTool({
     name: "wework_get_my_moments",
-    description: "拉取自己发布的朋友圈列表，结果通过事件异步返回",
+    description: "拉取自己发布的朋友圈列表 (先发刷新指令, 等 3s 让 WS push 入 SQLite, 再返回最新 20 条)",
     parameters: Type.Object({
       wxId: Type.String({ description: "企业微信ID" }),
     }),
     async execute(_id, params) {
-      const r = pullMySns(params.wxId);
-      return toResult(r, "个人朋友圈列表拉取指令已发送");
+      // 1) 先发刷新指令到 Java (fire-and-forget; 由 plugin server 进程接 push 入 SQLite)
+      const trig = pullMySns(params.wxId);
+      // 2) 粗略等 3 秒让 WS push 写库 (后续可改 EventEmitter await 精确化)
+      await new Promise((r) => setTimeout(r, 3000));
+      // 3) 读 SQLite (即使触发失败, 老缓存还能用)
+      const rows = listMoments(params.wxId, 20);
+      if (rows.length === 0) {
+        const tail = trig.success
+          ? "暂无朋友圈数据 (可能首次拉取还没回来, 重试一次)"
+          : `暂无朋友圈数据, 且刷新指令发送失败: ${trig.error}`;
+        return {
+          content: [{ type: "text" as const, text: tail }],
+          details: {},
+        };
+      }
+      const view = rows.map((r) => {
+        let images: Array<{ url: string; thumbUrl?: string }> = [];
+        try { images = r.image_urls ? JSON.parse(r.image_urls) : []; } catch { /* ignore */ }
+        return {
+          snsId: r.sns_id,
+          content: r.content,
+          imageUrls: images,
+          postAt: r.post_at,
+        };
+      });
+      const header = `共 ${rows.length} 条朋友圈 (refreshOk=${trig.success}):\n`;
+      return {
+        content: [{ type: "text" as const, text: header + JSON.stringify(view, null, 2) }],
+        details: {},
+      };
     },
   }));
 

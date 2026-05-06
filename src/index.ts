@@ -41,7 +41,7 @@ import { startAgentBackend } from "./services/agent-backend.js";
 import type { LLMProviderConfig } from "./services/llm-provider.js";
 import type { Server as HttpServer } from "node:http";
 import { handleAiCommand } from "./services/ai-command.js";
-import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getResolvedMediaStatus, clearResolvedMediaRecord, isTransientResolveError, getMessageMeta } from "./services/storage-service.js";
+import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getResolvedMediaStatus, clearResolvedMediaRecord, isTransientResolveError, getMessageMeta, upsertMoment, listMoments } from "./services/storage-service.js";
 
 // send-helper (CLI 直接调用)
 // 子进程模式下 Java pluginbot-cli 经常被互踢, 所有 send 路径都走 withRetry 版.
@@ -271,6 +271,64 @@ export default definePluginEntry({
               } else if (msgId) {
                 recordResolvedMediaUrl(msgId, "", ftNum, false, errStr);
                 logger.warn(`[Download] ❌ msgId=${msgId} fileType=${fileType} success=${success} err="${errStr ?? ""}"`);
+              }
+            }
+
+            // 朋友圈拉取结果 (我的朋友圈列表 / 单条详情) → 落 SQLite moments 表
+            // 解决 fire-and-forget: tool/CLI 发完 PullMySnsListTask 立即拿不到数据,
+            // 这里 WS push 进来后写库, tool/CLI 等几秒再读 SQLite 拿到.
+            // 字段映射 (proto bundle.d.ts 行 4977/5098/5220):
+            //   PullMySnsListTaskResultNoticeMessage:
+            //     WxId int64 / Success bool / ErrMsg / SnsList: ISnsInfoMessage[] / NextSeq
+            //   GetSnsDataTaskResultNoticeMessage:
+            //     WxId int64 / Success bool / ErrMsg / SnsInfo: ISnsInfoMessage / TaskId
+            //   ISnsInfoMessage:
+            //     SnsId int64 / Author int64 / Content string / Images: ISnsMediaInfoMessage[]
+            //     Link / Video: ISnsMediaInfoMessage / Comments / Likes / Time uint32 / PostId / Type
+            //   ISnsMediaInfoMessage: { ThumbImg, Url, Desc }
+            if (msgType === "PullMySnsListTaskResultNotice" || msgType === "GetSnsDataTaskResultNotice") {
+              const wxId = String(content.WxId ?? (content as any).wxId ?? "");
+              const success = (content.Success ?? (content as any).success) !== false;
+              if (!success) {
+                const err = content.ErrMsg ?? (content as any).errMsg;
+                logger.warn(`[Moments] ${msgType} 失败: ${err}`);
+              } else {
+                // 单条 (GetSnsData) 包成数组统一处理
+                const list: any[] = msgType === "PullMySnsListTaskResultNotice"
+                  ? ((content.SnsList ?? (content as any).snsList ?? []) as any[])
+                  : (() => {
+                      const one = content.SnsInfo ?? (content as any).snsInfo;
+                      return one ? [one] : [];
+                    })();
+
+                let saved = 0;
+                for (const sns of list) {
+                  if (!sns) continue;
+                  const snsId = String(sns.SnsId ?? sns.snsId ?? "");
+                  if (!snsId || snsId === "0") continue;
+                  // Time 字段: proto 是 uint32 秒. 兜底容忍各种大小写
+                  const tRaw = sns.Time ?? sns.time;
+                  const postAt = typeof tRaw === "number" ? tRaw
+                    : typeof tRaw === "string" ? Number(tRaw) || null
+                    : null;
+                  // 图片: Images 数组 + 可能的单 Video.Url 也归到 image_urls 一并展示
+                  const images = (sns.Images ?? sns.images ?? []) as any[];
+                  const imageUrls = images.map((img: any) => ({
+                    url: String(img?.Url ?? img?.url ?? ""),
+                    thumbUrl: img?.ThumbImg ?? img?.thumbImg ?? undefined,
+                  })).filter((i) => i.url);
+
+                  upsertMoment({
+                    wxId: wxId || String(sns.Author ?? sns.author ?? ""),
+                    snsId,
+                    content: (sns.Content ?? sns.content ?? null) as string | null,
+                    imageUrls,
+                    postAt,
+                    rawJson: JSON.stringify(sns),
+                  });
+                  saved++;
+                }
+                logger.info(`[Moments] ${msgType} 落库 ${saved} 条 (wxId=${wxId})`);
               }
             }
 
@@ -1069,12 +1127,52 @@ export default definePluginEntry({
         }));
 
       // --- 查看朋友圈 ---
+      // 注意: CLI 子进程自己没有 WS receive 端 (sendToJava 只发不收),
+      // 实际把 PullMySnsListTaskResultNotice 落到 SQLite moments 表的是
+      // plugin server 进程 (常驻 WS, 在 client.on("json-message",...) 里).
+      // CLI 等 3s 后从 SQLite 读. plugin server 离线则拿不到新数据 (TODO).
       ww.command("my-moments")
-        .description("拉取我的朋友圈")
+        .description("拉取我的朋友圈 (先发刷新指令, 等 3s 让 plugin server 入库, 再读 SQLite)")
         .argument("<wxId>", "企业微信ID")
-        .action(withConnection(async (wxId: string) => {
+        .option("-n, --limit <n>", "条数, 默认 20", "20")
+        .option("--json", "JSON 输出")
+        .action(withConnection(async (wxId: string, opts: { limit: string; json?: boolean }) => {
+          const limit = parseInt(opts.limit, 10) || 20;
           const r = pullMySns(wxId);
-          console.log(r.success ? "✅ 朋友圈列表拉取已发送" : `❌ ${r.error}`);
+          if (!r.success) {
+            // 刷新指令都没发出去, 也试一下读旧缓存兜底
+            if (!opts.json) console.log(`❌ 刷新指令发送失败: ${r.error}`);
+          }
+          // 等 3s 让 plugin server WS push 入库
+          await new Promise((rr) => setTimeout(rr, 3000));
+          const list = listMoments(wxId, limit);
+          if (opts.json) {
+            console.log(JSON.stringify({
+              refreshOk: r.success,
+              refreshError: r.success ? undefined : r.error,
+              count: list.length,
+              items: list.map((row) => {
+                let images: Array<{ url: string; thumbUrl?: string }> = [];
+                try { images = row.image_urls ? JSON.parse(row.image_urls) : []; } catch { /* ignore */ }
+                return {
+                  snsId: row.sns_id,
+                  content: row.content,
+                  imageUrls: images,
+                  postAt: row.post_at,
+                };
+              }),
+            }, null, 2));
+            return;
+          }
+          if (list.length === 0) {
+            console.log("(暂无朋友圈数据 — 可能首次拉取 plugin server 还没回写, 重试一次; 或 plugin server 没在跑)");
+            return;
+          }
+          for (const row of list) {
+            const ts = row.post_at ? new Date(row.post_at * 1000).toISOString() : "未知时间";
+            const snippet = (row.content ?? "").replace(/\n/g, " ").slice(0, 80);
+            console.log(`  [${ts}] snsId=${row.sns_id}  ${snippet}`);
+          }
         }));
 
       // --- 同步数据 ---
