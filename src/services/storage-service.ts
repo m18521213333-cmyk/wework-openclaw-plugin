@@ -188,7 +188,42 @@ function initTables(db: Database.Database): void {
       err_msg TEXT,
       ts TEXT DEFAULT (datetime('now'))
     );
+
+    -- 会话维度的本地元数据 (重命名 / 备注 等). messages 表只是流水, 这里独立维护
+    -- 让 web 给某 conv 起个本地昵称, JOIN 到 /api/conversations 返回里覆盖 sender_name.
+    CREATE TABLE IF NOT EXISTS conversations (
+      wx_id TEXT NOT NULL,
+      conv_id TEXT NOT NULL,
+      nick TEXT,                          -- 用户自定义昵称 (空则按消息原 sender_name)
+      updated_at TEXT DEFAULT (datetime('now')),
+      PRIMARY KEY (wx_id, conv_id)
+    );
   `);
+
+  // 兼容: 老库可能已有同名表但缺 nick 字段 → 加列. 失败 (字段已存在) 静默忽略.
+  try {
+    const cols = db.prepare(`PRAGMA table_info(conversations)`).all() as Array<{ name: string }>;
+    const hasNick = cols.some((c) => c.name === "nick");
+    if (cols.length > 0 && !hasNick) {
+      db.exec(`ALTER TABLE conversations ADD COLUMN nick TEXT`);
+    }
+  } catch { /* ignore */ }
+}
+
+// ============================================
+// 会话本地元数据 (重命名)
+// ============================================
+
+/** 给会话起 / 改本地昵称. nick=null 视为清空 */
+export function renameConversation(wxId: string, convId: string, nick: string | null): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO conversations (wx_id, conv_id, nick, updated_at)
+    VALUES (?, ?, ?, datetime('now'))
+    ON CONFLICT(wx_id, conv_id) DO UPDATE SET
+      nick = excluded.nick,
+      updated_at = excluded.updated_at
+  `).run(wxId, convId, nick);
 }
 
 // ============================================

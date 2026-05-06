@@ -35,6 +35,7 @@ import { handleAiReply } from "./services/dify-service.js";
 import { checkKeywordReply, checkAutoAcceptFriend, persistMessage } from "./services/automation-engine.js";
 import { startScheduler, stopScheduler } from "./services/scheduler-service.js";
 import { startPhoneMonitor, stopPhoneMonitor } from "./services/phone-monitor.js";
+import { startHealthMonitor, stopHealthMonitor } from "./services/health-monitor.js";
 import { startContactSync, stopContactSync, handleContactPush, getLastSyncTime } from "./services/contact-sync.js";
 import { startAgentBackend } from "./services/agent-backend.js";
 import type { LLMProviderConfig } from "./services/llm-provider.js";
@@ -338,8 +339,11 @@ export default definePluginEntry({
         // 启动定时任务调度
         startScheduler(logger);
 
-        // 启动手机 SDK 在线状态监控 (60s 轮询 MySQL, 状态变化时落库 + 告警)
+        // 启动手机 SDK 在线状态监控 (60s 轮询 MySQL, 状态变化时落库 + 告警 + 自动重连)
         startPhoneMonitor(logger, 60_000);
+
+        // 启动系统健康监控 (60s 轮询 Java WS / Redis / MySQL, 跳变时通过 healthEvents 广播)
+        startHealthMonitor(logger, 60_000);
 
         // 启动联系人定时同步 (启动 30s 后跑第一次, 之后每 30min 一次)
         // 同步指令发到 Java, 联系人列表回来走 ContactPushNotice → handleContactPush 落 SQLite contacts 表
@@ -386,6 +390,7 @@ export default definePluginEntry({
       async stop() {
         stopScheduler();
         stopPhoneMonitor();
+        stopHealthMonitor();
         stopContactSync();
         if (agentHttpServer) {
           await new Promise<void>((r) => agentHttpServer!.close(() => r()));

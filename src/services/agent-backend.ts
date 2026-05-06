@@ -20,6 +20,8 @@ import http from "node:http";
 import { runAgent, type ChatRequest } from "./agent-runner.js";
 import type { LLMTool, LLMProviderConfig } from "./llm-provider.js";
 import { queryPhones } from "./phone-monitor.js";
+import { renameConversation } from "./storage-service.js";
+import { healthEvents, type HealthEvent } from "./health-events.js";
 
 const PORT = parseInt(process.env.AGENT_BACKEND_PORT ?? "17800", 10);
 
@@ -456,19 +458,23 @@ export function startAgentBackend(opts: {
       const Database = (await import("better-sqlite3")).default;
       const db = new Database("/root/wework-scrm.db", { readonly: true });
       try {
-        // 按 conv_id 聚合, 取最近一条作为 preview, 顺便统计未读条数
+        // 按 conv_id 聚合, 取最近一条作为 preview, 顺便统计未读条数.
+        // LEFT JOIN conversations 拿用户自定义 nick (没有则 fallback messages.sender_name).
         const rows = db.prepare(`
           SELECT
-            conv_id,
-            MAX(sender_name) AS sender_name,
-            MAX(content_type) AS content_type,
-            MAX(content) AS last_content,
-            datetime(MAX(created_at), 'localtime') AS last_ts,
+            m.conv_id,
+            COALESCE(c.nick, MAX(m.sender_name)) AS sender_name,
+            c.nick AS nick,
+            MAX(m.content_type) AS content_type,
+            MAX(m.content) AS last_content,
+            datetime(MAX(m.created_at), 'localtime') AS last_ts,
             COUNT(*) AS msg_count
-          FROM messages
-          WHERE wx_id=? AND created_at > datetime('now', '-7 days')
-          GROUP BY conv_id
-          ORDER BY MAX(created_at) DESC
+          FROM messages m
+          LEFT JOIN conversations c
+            ON c.wx_id = m.wx_id AND c.conv_id = m.conv_id
+          WHERE m.wx_id=? AND m.created_at > datetime('now', '-7 days')
+          GROUP BY m.conv_id
+          ORDER BY MAX(m.created_at) DESC
           LIMIT ?
         `).all(wxId, limit) as any[];
         // 解码 base64 文本预览
@@ -490,6 +496,29 @@ export function startAgentBackend(opts: {
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       opts.logger.error(`[api/conversations] ${msg}`);
+      res.status(500).json({ code: -1, msg });
+    }
+  });
+
+  // POST /api/conversations/rename — 给会话起本地昵称
+  // body: { convId: string, nick: string | null }   (nick 空字符串/null 视为清空恢复原名)
+  // 多账号: 优先 X-WeWork-Account-Id header.
+  app.post("/api/conversations/rename", async (req, res) => {
+    try {
+      const wxId = readWxId(req as unknown as { headers: Record<string, unknown> });
+      const convId = String(req.body?.convId ?? "").trim();
+      const rawNick = req.body?.nick;
+      const nick = typeof rawNick === "string" ? rawNick.trim() : null;
+      if (!wxId || !convId) {
+        res.status(400).json({ code: -1, msg: "wxId + convId 必填" });
+        return;
+      }
+      // 空串当成清空 (恢复消息原 sender_name)
+      renameConversation(wxId, convId, nick && nick.length > 0 ? nick : null);
+      res.json({ code: 0, msg: "ok", data: { convId, nick } });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      opts.logger.error(`[api/conversations/rename] ${msg}`);
       res.status(500).json({ code: -1, msg });
     }
   });
@@ -661,6 +690,47 @@ export function startAgentBackend(opts: {
   });
 
   // GET /api/llm/providers
+  // GET /api/health/events (SSE) — 推 phone-offline / phone-reconnected / java-down/up / redis-down/up / mysql-down/up
+  // 前端 (web2 StatusPanel) 订阅显示 toast 通知.
+  // 仅广播未来事件, 不回放历史 (历史看 phone_status_events 表).
+  app.get("/api/health/events", (req: Request, res: Response) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no"); // nginx 不缓冲
+    // flushHeaders 让客户端立即收到 200 (Express 5 默认 headersSent 即可, 这里显式调以兼容)
+    if (typeof res.flushHeaders === "function") {
+      res.flushHeaders();
+    }
+
+    // 起始 hello 事件 — 前端用来确认连通
+    res.write(`event: ready\ndata: ${JSON.stringify({ ts: Date.now() })}\n\n`);
+
+    const onEvent = (ev: HealthEvent): void => {
+      try {
+        // SSE 标准: event: <type> + data: <json> + 空行
+        res.write(`event: ${ev.type}\ndata: ${JSON.stringify(ev)}\n\n`);
+      } catch {
+        // 写失败 — 客户端断了, off 由 close handler 处理
+      }
+    };
+    healthEvents.on("event", onEvent);
+
+    // 心跳 (15s 一次), 防止中间代理 idle close
+    const ping = setInterval(() => {
+      try {
+        res.write(`: ping ${Date.now()}\n\n`);
+      } catch { /* ignore */ }
+    }, 15_000);
+
+    const cleanup = (): void => {
+      clearInterval(ping);
+      healthEvents.off("event", onEvent);
+    };
+    req.on("close", cleanup);
+    req.on("error", cleanup);
+  });
+
   app.get("/api/llm/providers", (_req, res) => {
     // 当前只支持单 provider (从启动配置). 后续可加 DB 存多个.
     if (!opts.defaultProvider) {
