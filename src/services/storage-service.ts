@@ -733,6 +733,35 @@ export function getMessageMeta(wxId: string, msgId: string): any | null {
   return db.prepare("SELECT msg_id, msg_remote_id, content_type, content FROM messages WHERE wx_id=? AND msg_id=? LIMIT 1").get(wxId, msgId);
 }
 
+// ============================================================================
+// 朋友圈发布结果 — 内存 map (PostSnsTaskResultNotice 异步回执)
+// 由 plugin server WS handler 写, tool execute await 后读.
+// 简单 wxId 为 key (单账号同时发多条朋友圈是边界情况, 不优化).
+// ============================================================================
+export interface PostMomentsResult {
+  success: boolean;
+  errMsg?: string;
+  ts: number;  // 收到回执的时间
+}
+const postMomentsResults = new Map<string, PostMomentsResult>();
+
+/** WS handler 写入 (PostSnsTaskResultNotice) */
+export function recordPostMomentsResult(wxId: string, success: boolean, errMsg?: string): void {
+  postMomentsResults.set(wxId, { success, errMsg, ts: Date.now() });
+}
+
+/** tool 读取并清掉 (拿一次就消费) */
+export function takePostMomentsResult(wxId: string): PostMomentsResult | null {
+  const r = postMomentsResults.get(wxId);
+  if (r) postMomentsResults.delete(wxId);
+  return r ?? null;
+}
+
+/** tool 调发布前先清旧的 (防止上一次留下的结果污染) */
+export function clearPostMomentsResult(wxId: string): void {
+  postMomentsResults.delete(wxId);
+}
+
 /**
  * 按名字找私聊联系人 — 仅查 contacts 表 (从工作微信同步过来的联系人目录).
  *

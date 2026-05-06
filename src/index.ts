@@ -41,7 +41,7 @@ import { startAgentBackend } from "./services/agent-backend.js";
 import type { LLMProviderConfig } from "./services/llm-provider.js";
 import type { Server as HttpServer } from "node:http";
 import { handleAiCommand } from "./services/ai-command.js";
-import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getResolvedMediaStatus, clearResolvedMediaRecord, isTransientResolveError, getMessageMeta, upsertMoment, listMoments, getMomentBySnsId, upsertMomentsTask, listMomentsTasks, upsertQrcode } from "./services/storage-service.js";
+import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getResolvedMediaStatus, clearResolvedMediaRecord, isTransientResolveError, getMessageMeta, upsertMoment, listMoments, getMomentBySnsId, upsertMomentsTask, listMomentsTasks, upsertQrcode, recordPostMomentsResult } from "./services/storage-service.js";
 
 // send-helper (CLI 直接调用)
 // 子进程模式下 Java pluginbot-cli 经常被互踢, 所有 send 路径都走 withRetry 版.
@@ -347,6 +347,18 @@ export default definePluginEntry({
                   }).catch((e) => logger.warn(`[Moments] write-through MySQL fail: ${(e as Error).message}`));
                 }
                 logger.info(`[Moments] ${msgType} 落库 ${saved} 条 (wxId=${wxId})`);
+              }
+            }
+
+            // 朋友圈发布回执 (PostSnsTaskResultNotice / PostSnsTaskTaskResultNotice)
+            // 解决 fire-and-forget 假成功: 写内存 map, post_moments tool await 后读
+            if (msgType === "PostSnsTaskResultNotice" || msgType === "PostSnsTaskTaskResultNotice") {
+              const wxId = String(content.WxId ?? (content as any).wxId ?? "");
+              const success = (content.Success ?? (content as any).success) === true;
+              const errMsg = String(content.ErrMsg ?? (content as any).errMsg ?? "");
+              if (wxId) {
+                recordPostMomentsResult(wxId, success, errMsg);
+                logger.info(`[Moments] ${msgType} 回执: wxId=${wxId} success=${success} errMsg=${errMsg.slice(0, 80)}`);
               }
             }
 

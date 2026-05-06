@@ -15,6 +15,7 @@
 
 import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import { clearPostMomentsResult, takePostMomentsResult } from "../services/storage-service.js";
 import {
   postMoments,
   postMomentsTask,
@@ -74,6 +75,8 @@ export function registerMomentsTools(api: OpenClawPluginApi) {
       ),
     }),
     async execute(_id, params) {
+      // 清掉旧回执 + 发指令
+      clearPostMomentsResult(params.wxId);
       const r = postMoments(
         params.wxId,
         params.content,
@@ -83,7 +86,30 @@ export function registerMomentsTools(api: OpenClawPluginApi) {
         params.linkTitle,
         params.visibleList,
       );
-      return toResult(r, `朋友圈发布指令已发送 (${params.contentType ?? "text"})`);
+      if (!r.success) {
+        return { content: [{ type: "text" as const, text: `朋友圈发布失败: ${r.error}` }], details: {}, isError: true };
+      }
+      // await 真回执 (PostSnsTaskResultNotice WS push), 最长等 10s
+      const start = Date.now();
+      while (Date.now() - start < 10_000) {
+        const result = takePostMomentsResult(params.wxId);
+        if (result) {
+          if (result.success) {
+            return { content: [{ type: "text" as const, text: `朋友圈已成功发布 (${params.contentType ?? "text"}, 用时 ${Math.round((Date.now()-start)/100)/10}s)` }], details: {} };
+          }
+          return { content: [{ type: "text" as const, text: `朋友圈发布失败 (手机端拒绝): ${result.errMsg || "未知"}` }], details: {}, isError: true };
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      // 超时: 回执没到, 不能确认成功 — isError 让上层不当成成功, LLM 也别美化
+      return {
+        content: [{
+          type: "text" as const,
+          text: `❌ 朋友圈发布未确认: 10s 内手机端没回 PostSnsTaskResultNotice. 不能算成功! 可能原因: 手机离线 / SDK 卡住 / 朋友圈被风控. 请刷新手机端朋友圈或调 wework_get_my_moments 看是否真发出. **不要告诉用户已成功**, 老实说还在等.`,
+        }],
+        details: {},
+        isError: true,
+      };
     },
   }));
 
