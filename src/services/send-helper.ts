@@ -548,6 +548,17 @@ export function phoneState(wxId: string): SendResult {
   return sendToJava("PhoneStateTask", { WxId: String(wxId) });
 }
 
+/**
+ * 触发工作手机重连尝试.
+ *
+ * 注: Java 协议没有专门的 Reconnect task. 这里复用 PhoneStateTask (查询状态),
+ * 触发 Java 给手机发心跳/状态查询包. 部分场景下卡死的 SDK 连接会借此恢复,
+ * 不保证一定成功 — 真实重连结果由下次 phone-monitor poll MySQL isonline 确认.
+ */
+export function reconnectPhone(wxId: string): SendResult {
+  return sendToJava("PhoneStateTask", { WxId: String(wxId) });
+}
+
 export function pullQrCode(wxId: string): SendResult {
   return sendToJava("PullMyQrCodeTask", { WxId: String(wxId) });
 }

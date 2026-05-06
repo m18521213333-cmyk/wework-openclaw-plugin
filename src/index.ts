@@ -48,7 +48,7 @@ import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts,
 // sync 版 (sendMessage/forwardMessage/...) 留给后台 service 进程的事件回调用 — 那边 WS 长连接稳定.
 import {
   searchMessages, triggerHistoryMessages,
-  getContactInfo, triggerSync, phoneState,
+  getContactInfo, triggerSync, phoneState, reconnectPhone,
   pullMySns,
   waitTaskResult,
   sendMessageWithRetry, forwardMessageWithRetry,
@@ -319,15 +319,32 @@ export default definePluginEntry({
                     thumbUrl: img?.ThumbImg ?? img?.thumbImg ?? undefined,
                   })).filter((i) => i.url);
 
+                  const finalWxId = wxId || String(sns.Author ?? sns.author ?? "");
+                  const contentStr = (sns.Content ?? sns.content ?? null) as string | null;
+                  const rawJson = JSON.stringify(sns);
                   upsertMoment({
-                    wxId: wxId || String(sns.Author ?? sns.author ?? ""),
+                    wxId: finalWxId,
                     snsId,
-                    content: (sns.Content ?? sns.content ?? null) as string | null,
+                    content: contentStr,
                     imageUrls,
                     postAt,
-                    rawJson: JSON.stringify(sns),
+                    rawJson,
                   });
                   saved++;
+
+                  // 写穿到 Java MySQL (备份, fire-and-forget, 失败不影响 SQLite)
+                  fetch("http://127.0.0.1:15086/api/wework/moments/upsert", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                    body: new URLSearchParams({
+                      wxId: finalWxId,
+                      snsId,
+                      content: contentStr ?? "",
+                      imageUrls: JSON.stringify(imageUrls),
+                      postAt: postAt != null ? String(postAt) : "",
+                      rawJson,
+                    }),
+                  }).catch((e) => logger.warn(`[Moments] write-through MySQL fail: ${(e as Error).message}`));
                 }
                 logger.info(`[Moments] ${msgType} 落库 ${saved} 条 (wxId=${wxId})`);
               }
@@ -1358,6 +1375,17 @@ export default definePluginEntry({
         .action(withConnection(async (wxId: string) => {
           const r = phoneState(wxId);
           console.log(r.success ? "✅ 手机状态查询已发送" : `❌ ${r.error}`);
+        }));
+
+      // --- 重连手机 (phone-monitor 自动调) ---
+      // 注: Java 协议没专门 Reconnect task, 复用 PhoneStateTask 触发心跳.
+      // 真实是否上线由下次 monitor 拉 MySQL isonline 确认.
+      ww.command("reconnect-phone")
+        .description("尝试重连工作手机")
+        .requiredOption("--wx-id <wxId>", "企业微信 ID")
+        .action(withConnection(async (opts: { wxId: string }) => {
+          const r = reconnectPhone(opts.wxId);
+          console.log(r.success ? `✅ 重连指令已发送 (wxId=${opts.wxId})` : `❌ ${r.error}`);
         }));
 
       // --- 撤回消息 ---
