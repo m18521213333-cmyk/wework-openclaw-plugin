@@ -733,12 +733,20 @@ export function getMessageMeta(wxId: string, msgId: string): any | null {
   return db.prepare("SELECT msg_id, msg_remote_id, content_type, content FROM messages WHERE wx_id=? AND msg_id=? LIMIT 1").get(wxId, msgId);
 }
 
+/**
+ * 按名字找私聊联系人 — 仅查 contacts 表 (从工作微信同步过来的联系人目录).
+ *
+ * 语义: 你说人名 = 100% 找私聊对象. 永远不混入聊天历史 (聊天历史的 sender_name
+ * 可能来自群消息, 误用会把群 conv_id 当联系人 → send_message 发到群里).
+ *
+ * 联系人没同步? 让用户先 `wework sync <wxId> contacts` 触发同步,
+ * 而不是从聊天记录瞎匹配.
+ */
 export function findContactsByName(wxId: string, namePattern: string, limit = 10): any[] {
   const db = getDb();
   const like = `%${namePattern}%`;
 
-  // 1) 主源: contacts 表 (含未聊过的同步联系人)
-  const fromContacts = db.prepare(`
+  return db.prepare(`
     SELECT
       remote_id    AS conv_id,
       name         AS sender_name,
@@ -753,38 +761,6 @@ export function findContactsByName(wxId: string, namePattern: string, limit = 10
     ORDER BY last_synced_at DESC
     LIMIT ?
   `).all(wxId, like, like, limit) as any[];
-
-  // 2) 备用源: messages 表 (聊过的联系人, 即使没在 contacts 里)
-  // 关键过滤: conv_id = sender_id (1对1 私聊里 conv_id == 对方 remote_id == sender_id;
-  //          群聊里 conv_id 是群 ID, 不等于成员 sender_id, 必须排除否则
-  //          LLM 把 "赵丽" 解析成她所在群的 conv_id, send_message 就发到群里了!)
-  const haveRemoteIds = new Set(fromContacts.map((c: any) => c.conv_id));
-  const fromMessages = db.prepare(`
-    SELECT
-      conv_id,
-      sender_name,
-      NULL         AS alias,
-      NULL         AS corp_name,
-      NULL         AS contact_type,
-      MAX(created_at) AS last_seen,
-      'message'    AS source,
-      COUNT(*)     AS msg_count
-    FROM messages
-    WHERE wx_id=? AND sender_name LIKE ?
-      AND conv_id = sender_id     -- 仅 1对1 私聊 (排除群)
-      AND sender_id IS NOT NULL
-      AND sender_id <> ''
-    GROUP BY conv_id, sender_name
-    ORDER BY MAX(created_at) DESC
-    LIMIT ?
-  `).all(wxId, like, limit) as any[];
-
-  // 合并 (contacts 优先), 同 conv_id 不重复
-  const merged = [...fromContacts];
-  for (const m of fromMessages) {
-    if (!haveRemoteIds.has(m.conv_id)) merged.push(m);
-  }
-  return merged.slice(0, limit);
 }
 
 // 联系人表 upsert (从 Java push notice 调用)

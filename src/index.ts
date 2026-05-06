@@ -910,7 +910,8 @@ export default definePluginEntry({
           if (opts.json) { console.log(JSON.stringify(matches, null, 2)); return; }
           if (matches.length === 0) {
             console.log(`❌ 没找到名字含 "${namePattern}" 的联系人`);
-            console.log(`提示: 必须曾经跟你聊过 (在 SQLite messages 表里有记录) 才能查到. 没聊过的需要先 wework sync ${wxId} contacts 同步通讯录.`);
+            console.log(`提示: 仅查 contacts 联系人表 (不再用聊天记录, 避免把群成员当联系人).`);
+            console.log(`如确认这人加过, 先同步通讯录: wework sync ${wxId} contacts`);
             return;
           }
           console.log(`找到 ${matches.length} 个匹配 "${namePattern}" 的会话:`);
