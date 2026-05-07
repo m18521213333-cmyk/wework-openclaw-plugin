@@ -118,6 +118,13 @@ function buildSystemPrompt(ctx: ChatRequest["context"]): string {
    - 正确: 等所有 tool call 真返回成功结果后, 才写"已发给 N 人".
    - 工具失败时如实报失败原因, 不要美化.
 
+6. **🚫 严禁不调工具就编结果 (最严重违规!)**.
+   - 用户问 "群发 X Y" / "给 X 发消息" / "撤回" / "打标签" 等任何 mutation 操作, 你 **必须** 调对应工具.
+   - 不允许只看用户消息内容就直接回 "已群发 / 已发送 / 已完成" 而不调工具.
+   - 不允许因为"用户已经给了 convId" 就跳过工具调用直接编 "已发".
+   - 检测信号: 如果你这一回合 tool_calls 数组为空, 但回复里写了 "已" / "成功" / "完成", 一定是错的. 重写: 调工具.
+   - 例外: 用户问的是查询/状态 (例如"今天发了几条"/"系统状态怎样"), 调对应查询工具后才能答; 不调就答 = 编造.
+
 ## 当前用户
 
 - 工作微信 wxId: ${ctx?.wxId ?? DEFAULT_WX_ID}
@@ -229,8 +236,29 @@ export async function runAgent(
       }
     }
 
-    // 整个 stream 结束 — 如果是 stop, 整个 conversation 结束
+    // 整个 stream 结束 — 如果是 stop / 没 tool_calls, 准备退出. 但先做幻觉后置校验.
     if (finishReason === "stop" || finishReason === "length" || toolCallsByIndex.size === 0) {
+      // 🔥 幻觉后置校验: LLM 0 tool_call 但 final 含"已 + 操作动词" → 强 retry 一次
+      // Kimi 偶尔会偷懒不调工具直接编"已群发"等. 这里检测到就追一条 system 让它真调.
+      const looksLikeFakeSuccess = /(已|成功)\s*(发|群发|撤回|删除|删了|删除了|打了?标签|加好友|发送|发布|发出|发了|做了)/.test(text);
+      const lacksToolCall = toolCallsByIndex.size === 0;
+      // 防死循环 — 只 retry 一次
+      const alreadyRetried = (req as { _antiHallucinationRetried?: boolean })._antiHallucinationRetried === true;
+      if (looksLikeFakeSuccess && lacksToolCall && !alreadyRetried) {
+        console.warn(`[agent] 幻觉检测: LLM 输出 "${text.slice(0, 80)}..." 但 0 tool_call. 强制 retry`);
+        (req as { _antiHallucinationRetried?: boolean })._antiHallucinationRetried = true;
+        // 给 LLM 一条 system 反馈, 让它真调工具
+        messages.push({
+          role: "assistant",
+          content: text,
+        });
+        messages.push({
+          role: "user",
+          content: "⚠️ 你刚才说\"已发/已成功\"但是没有真调工具! 这是违反铁律 6 的幻觉. 请重做 — 必须真的调对应工具 (wework_send_message / wework_mass_send 等), 拿到工具的真返回结果后再答. 不要再编了.",
+        });
+        // 不 break, 继续下一轮
+        continue;
+      }
       break;
     }
 

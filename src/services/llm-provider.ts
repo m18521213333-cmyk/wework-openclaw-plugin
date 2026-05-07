@@ -76,7 +76,18 @@ export async function* streamOpenAICompatible(
 
   if (!resp.ok || !resp.body) {
     const errText = await resp.text().catch(() => "");
-    throw new Error(`LLM HTTP ${resp.status}: ${errText.slice(0, 300)}`);
+    // 友好 LLM 错误文案 — 用户不该看到 raw 429 / engine_overloaded
+    let friendly = `LLM HTTP ${resp.status}`;
+    if (resp.status === 429 || /overload|rate.?limit|too.?many/i.test(errText)) {
+      friendly = `LLM 提供商繁忙 (HTTP ${resp.status} 限流), 请稍等几秒重试. 或在 设置 → LLM Provider 切换备用 provider.`;
+    } else if (resp.status === 401 || resp.status === 403) {
+      friendly = `LLM API key 无效或额度用完 (HTTP ${resp.status}). 去 设置 → LLM Provider 检查或换 key.`;
+    } else if (resp.status >= 500) {
+      friendly = `LLM 服务器内部错 (HTTP ${resp.status}). 稍等再试或换 provider.`;
+    } else {
+      friendly = `LLM 出错: HTTP ${resp.status} — ${errText.slice(0, 200)}`;
+    }
+    throw new Error(friendly);
   }
 
   const reader = resp.body.getReader();
