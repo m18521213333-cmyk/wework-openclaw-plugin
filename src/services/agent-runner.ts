@@ -62,15 +62,27 @@ function renderAttachmentsHint(
   return "\n\n" + lines.join("\n");
 }
 
-/** 确认门 — 哪些工具调用前必须等用户确认 */
+/** 确认门 — 哪些工具调用前必须等用户确认 (破坏性 / 高副作用) */
 const CONFIRM_REQUIRED = new Set([
-  "wework_mass_send",
-  "account_delete",
-  "wework_revoke_message", // 撤回也算
+  "wework_mass_send",          // 群发, 影响多人
+  "wework_revoke_message",     // 撤回 (对方可能看到)
+  "wework_delete_customer",    // 删客户, 不可逆
+  "wework_delete_label",       // 删标签, 影响所有打过此签的客户
+  "wework_modify_label",       // 改标签名, 影响所有打过的客户
+  "wework_set_user_labels",    // 给用户打标签 (LLM 一句话可能误打数十人)
+  "wework_delete_moments",     // 删朋友圈, 不可逆
+  "wework_delete_sns_comment", // 删评论
+  "wework_post_moments",       // 发朋友圈是公开行为
+  "wework_post_moments_task",  // 同上
 ]);
 function isConfirmRequired(name: string, args: Record<string, unknown>): boolean {
   if (CONFIRM_REQUIRED.has(name)) return true;
-  // 群发收件人 > 5 也确认
+  // 群操作: 踢人 / 退群 / 解散 — 不可逆, 强制确认
+  if (name === "wework_chatroom_action") {
+    const a = String(args.action ?? "");
+    if (["kick", "quit", "exit", "remove_member", "dismiss"].includes(a)) return true;
+  }
+  // 群发收件人 > 5 也确认 (mass_send 已经在 set 里, 这里是双保险)
   if (name === "wework_mass_send") {
     const arr = args.convIds as unknown[] | undefined;
     if (Array.isArray(arr) && arr.length > 5) return true;
