@@ -101,14 +101,14 @@ export function registerMomentsTools(api: OpenClawPluginApi) {
         }
         await new Promise((r) => setTimeout(r, 500));
       }
-      // 超时: 回执没到, 不能确认成功 — isError 让上层不当成成功, LLM 也别美化
+      // 超时: 不算 isError (避免 LLM 反悔说"失败"导致用户重发 → 重复发布!)
+      // 改成中性 pending 文案, 让 LLM 引导用户用 wework_get_my_moments 复查
       return {
         content: [{
           type: "text" as const,
-          text: `❌ 朋友圈发布未确认: 10s 内手机端没回 PostSnsTaskResultNotice. 不能算成功! 可能原因: 手机离线 / SDK 卡住 / 朋友圈被风控. 请刷新手机端朋友圈或调 wework_get_my_moments 看是否真发出. **不要告诉用户已成功**, 老实说还在等.`,
+          text: `⏳ 朋友圈发布指令已下发, 但 20s 内手机端还没回 PostSnsTaskResultNotice 回执. **不能算成功也不能算失败** — SDK 高峰期推送会延迟到 30-60s. 请用 wework_get_my_moments 拉一次最新列表确认是否真发出, 不要直接重发避免重复发布.`,
         }],
         details: {},
-        isError: true,
       };
     },
   }));
