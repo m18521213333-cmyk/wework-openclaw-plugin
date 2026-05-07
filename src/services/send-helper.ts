@@ -209,40 +209,64 @@ export async function sendMessageWithRetry(
   );
 }
 
-export function revokeMessage(wxId: string, msgId: string, convId: string): SendResult {
-  return sendToJava("MsgRevokeTask", {
-    WxId: String(wxId), MsgId: String(msgId), ConvId: String(convId),
+/**
+ * 生成一个本次任务的 TaskId (Date.now() 单进程不会冲突).
+ * 工具/CLI 在调 *WithTaskId 之前可以预先生成, 这样能 await task_results 表里同 taskId 的回执.
+ */
+export function nextTaskId(): number {
+  return Date.now();
+}
+
+export function revokeMessage(wxId: string, msgId: string, convId: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("MsgRevokeTask", {
+    WxId: String(wxId), MsgId: String(msgId), ConvId: String(convId), TaskId: String(tid),
   });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export async function revokeMessageWithRetry(wxId: string, msgId: string, convId: string, opts?: SendRetryOpts): Promise<SendResult> {
-  return sendToJavaWithRetry("MsgRevokeTask", {
-    WxId: String(wxId), MsgId: String(msgId), ConvId: String(convId),
+export async function revokeMessageWithRetry(wxId: string, msgId: string, convId: string, opts?: SendRetryOpts, taskId?: number): Promise<SendResult> {
+  const tid = taskId ?? nextTaskId();
+  const r = await sendToJavaWithRetry("MsgRevokeTask", {
+    WxId: String(wxId), MsgId: String(msgId), ConvId: String(convId), TaskId: String(tid),
   }, opts);
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function forwardMessage(wxId: string, msgId: string, fromConvId: string, toConvId: string): SendResult {
-  return sendToJava("ForwardMsgTask", {
+export function forwardMessage(wxId: string, msgId: string, fromConvId: string, toConvId: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("ForwardMsgTask", {
     WxId: String(wxId), MsgId: String(msgId), ConvId: String(fromConvId), ToConvId: String(toConvId),
+    TaskId: String(tid),
   });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export async function forwardMessageWithRetry(wxId: string, msgId: string, fromConvId: string, toConvId: string, opts?: SendRetryOpts): Promise<SendResult> {
-  return sendToJavaWithRetry("ForwardMsgTask", {
+export async function forwardMessageWithRetry(wxId: string, msgId: string, fromConvId: string, toConvId: string, opts?: SendRetryOpts, taskId?: number): Promise<SendResult> {
+  const tid = taskId ?? nextTaskId();
+  const r = await sendToJavaWithRetry("ForwardMsgTask", {
     WxId: String(wxId), MsgId: String(msgId), ConvId: String(fromConvId), ToConvId: String(toConvId),
+    TaskId: String(tid),
   }, opts);
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function forwardMultiMessages(wxId: string, msgIds: string[], fromConvId: string, toConvId: string): SendResult {
-  return sendToJava("ForwardMultiTask", {
+export function forwardMultiMessages(wxId: string, msgIds: string[], fromConvId: string, toConvId: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("ForwardMultiTask", {
     WxId: String(wxId), MsgIds: msgIds.map(String), ConvId: String(fromConvId), ToConvId: String(toConvId),
+    TaskId: String(tid),
   });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export async function forwardMultiMessagesWithRetry(wxId: string, msgIds: string[], fromConvId: string, toConvId: string, opts?: SendRetryOpts): Promise<SendResult> {
-  return sendToJavaWithRetry("ForwardMultiTask", {
+export async function forwardMultiMessagesWithRetry(wxId: string, msgIds: string[], fromConvId: string, toConvId: string, opts?: SendRetryOpts, taskId?: number): Promise<SendResult> {
+  const tid = taskId ?? nextTaskId();
+  const r = await sendToJavaWithRetry("ForwardMultiTask", {
     WxId: String(wxId), MsgIds: msgIds.map(String), ConvId: String(fromConvId), ToConvId: String(toConvId),
+    TaskId: String(tid),
   }, opts);
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
 export function searchMessages(wxId: string, keyword: string, convId?: string): SendResult {
@@ -261,48 +285,71 @@ export function triggerHistoryMessages(wxId: string, convId: string, count: numb
 // 阶段 4: 联系人
 // ============================================
 
-export function getContactInfo(wxId: string, remoteId: string): SendResult {
-  return sendToJava("GetContactInfoTask", { WxId: String(wxId), RemoteId: String(remoteId) });
+export function getContactInfo(wxId: string, remoteId: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("GetContactInfoTask", { WxId: String(wxId), RemoteId: String(remoteId), TaskId: String(tid) });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function addCustomerById(wxId: string, remoteId: string, verifyContent?: string): SendResult {
-  const p: Record<string, unknown> = { WxId: String(wxId), RemoteId: String(remoteId) };
+export function addCustomerById(wxId: string, remoteId: string, verifyContent?: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const p: Record<string, unknown> = { WxId: String(wxId), RemoteId: String(remoteId), TaskId: String(tid) };
   if (verifyContent) p.VerifyContent = verifyContent;
-  return sendToJava("AddCustomerByIdTask", p);
+  const r = sendToJava("AddCustomerByIdTask", p);
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function addCustomerFromSearch(wxId: string, searchText: string, verifyContent?: string): SendResult {
-  const p: Record<string, unknown> = { WxId: String(wxId), SearchText: searchText };
+export function addCustomerFromSearch(wxId: string, searchText: string, verifyContent?: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const p: Record<string, unknown> = { WxId: String(wxId), SearchText: searchText, TaskId: String(tid) };
   if (verifyContent) p.VerifyContent = verifyContent;
-  return sendToJava("AddCustomerFromSearchTask", p);
+  const r = sendToJava("AddCustomerFromSearchTask", p);
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function addCustomerFromWx(wxId: string, wxFriendId: string, verifyContent?: string): SendResult {
-  const p: Record<string, unknown> = { WxId: String(wxId), WxFriendId: Number(wxFriendId) };
+export function addCustomerFromWx(wxId: string, wxFriendId: string, verifyContent?: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const p: Record<string, unknown> = { WxId: String(wxId), WxFriendId: Number(wxFriendId), TaskId: String(tid) };
   if (verifyContent) p.VerifyContent = verifyContent;
-  return sendToJava("AddCustomerFromWxTask", p);
+  const r = sendToJava("AddCustomerFromWxTask", p);
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function deleteCustomer(wxId: string, remoteId: string): SendResult {
-  return sendToJava("TriggerCustomerPushTask", { WxId: String(wxId), RemoteId: String(remoteId) });
+/**
+ * 删除客户. 历史代码用了 TriggerCustomerPushTask (强同步联系人), 但语义不对. 改成
+ * 真正的 DelCustomerTask. 老调用方传 TriggerCustomerPushTask 的没 TaskId, 这里加上.
+ */
+export function deleteCustomer(wxId: string, remoteId: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("DelCustomerTask", { WxId: String(wxId), RemoteId: String(remoteId), TaskId: String(tid) });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function acceptCustomer(wxId: string, remoteId: string): SendResult {
-  return sendToJava("AcceptCustomerTask", { WxId: String(wxId), RemoteId: String(remoteId) });
+export function acceptCustomer(wxId: string, remoteId: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("AcceptCustomerTask", { WxId: String(wxId), RemoteId: String(remoteId), TaskId: String(tid) });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function setUserMemo(wxId: string, remoteId: string, memo: string): SendResult {
-  return sendToJava("SetUserMemoTask", { WxId: String(wxId), RemoteId: String(remoteId), Memo: memo });
+export function setUserMemo(wxId: string, remoteId: string, memo: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("SetUserMemoTask", { WxId: String(wxId), RemoteId: String(remoteId), Memo: memo, TaskId: String(tid) });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function getExtUserId(wxId: string, remoteId: string): SendResult {
-  return sendToJava("GetExtUserIdTask", { WxId: String(wxId), RemoteId: String(remoteId) });
+export function getExtUserId(wxId: string, remoteId: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("GetExtUserIdTask", { WxId: String(wxId), RemoteId: String(remoteId), TaskId: String(tid) });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function sendFriendVerify(wxId: string, remoteId: string, verifyContent?: string): SendResult {
-  const p: Record<string, unknown> = { WxId: String(wxId), RemoteId: String(remoteId) };
+export function sendFriendVerify(wxId: string, remoteId: string, verifyContent?: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const p: Record<string, unknown> = { WxId: String(wxId), RemoteId: String(remoteId), TaskId: String(tid) };
   if (verifyContent) p.VerifyContent = verifyContent;
-  return sendToJava("AddCustomerByIdTask", p);
+  // proto 没有 SendFriendVerifyTask 单独消息, 复用 AddCustomerByIdTask (跟历史一致)
+  const r = sendToJava("AddCustomerByIdTask", p);
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
 // ============================================
@@ -416,20 +463,28 @@ export function getGroupMembers(wxId: string, convId: string): SendResult {
   return sendToJava("ChatRoomActionTask", { WxId: String(wxId), ConvId: String(convId), Action: -1 });
 }
 
-export function createLabel(wxId: string, labelName: string): SendResult {
-  return sendToJava("UserLabelSetTask", { WxId: String(wxId), LabelName: labelName });
+export function createLabel(wxId: string, labelName: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("UserLabelSetTask", { WxId: String(wxId), LabelName: labelName, TaskId: String(tid) });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function deleteLabel(wxId: string, labelId: string): SendResult {
-  return sendToJava("UserLabelDelTask", { WxId: String(wxId), LabelId: Number(labelId) });
+export function deleteLabel(wxId: string, labelId: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("UserLabelDelTask", { WxId: String(wxId), LabelId: Number(labelId), TaskId: String(tid) });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function modifyLabel(wxId: string, labelId: string, labelName: string): SendResult {
-  return sendToJava("UserLabelModifyTask", { WxId: String(wxId), LabelId: Number(labelId), LabelName: labelName });
+export function modifyLabel(wxId: string, labelId: string, labelName: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("UserLabelModifyTask", { WxId: String(wxId), LabelId: Number(labelId), LabelName: labelName, TaskId: String(tid) });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function setUserLabels(wxId: string, remoteId: string, labelIds: string[]): SendResult {
-  return sendToJava("UserSetLabelTask", { WxId: String(wxId), RemoteId: String(remoteId), LabelIds: labelIds.map(Number) });
+export function setUserLabels(wxId: string, remoteId: string, labelIds: string[], taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("UserSetLabelTask", { WxId: String(wxId), RemoteId: String(remoteId), LabelIds: labelIds.map(Number), TaskId: String(tid) });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
 export function triggerLabelSync(wxId: string): SendResult {
@@ -522,22 +577,30 @@ export function pullSnsTaskList(wxId: string): SendResult {
   return sendToJava("PullSnsTaskListTask", { WxId: String(wxId) });
 }
 
-export function snsComment(wxId: string, snsId: string, content: string, replyTo?: string): SendResult {
-  const p: Record<string, unknown> = { WxId: String(wxId), SnsId: String(snsId), Content: content };
+export function snsComment(wxId: string, snsId: string, content: string, replyTo?: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const p: Record<string, unknown> = { WxId: String(wxId), SnsId: String(snsId), Content: content, TaskId: String(tid) };
   if (replyTo) p.ReplyTo = Number(replyTo);
-  return sendToJava("SnsCommentTask", p);
+  const r = sendToJava("SnsCommentTask", p);
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function snsLike(wxId: string, snsId: string): SendResult {
-  return sendToJava("SnsLikeTask", { WxId: String(wxId), SnsId: String(snsId) });
+export function snsLike(wxId: string, snsId: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("SnsLikeTask", { WxId: String(wxId), SnsId: String(snsId), TaskId: String(tid) });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function deleteSns(wxId: string, snsId: string): SendResult {
-  return sendToJava("DelSnsTask", { WxId: String(wxId), SnsId: String(snsId) });
+export function deleteSns(wxId: string, snsId: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("DelSnsTask", { WxId: String(wxId), SnsId: String(snsId), TaskId: String(tid) });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
-export function deleteSnsComment(wxId: string, snsId: string, commentId: string): SendResult {
-  return sendToJava("DelSnsCommentTask", { WxId: String(wxId), SnsId: String(snsId), CommentId: Number(commentId) });
+export function deleteSnsComment(wxId: string, snsId: string, commentId: string, taskId?: number): SendResult {
+  const tid = taskId ?? nextTaskId();
+  const r = sendToJava("DelSnsCommentTask", { WxId: String(wxId), SnsId: String(snsId), CommentId: Number(commentId), TaskId: String(tid) });
+  return r.success ? { success: true, taskId: tid } : r;
 }
 
 // ============================================

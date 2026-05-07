@@ -18,11 +18,23 @@
 import express, { type Request, type Response } from "express";
 import http from "node:http";
 import { runAgent, type ChatRequest } from "./agent-runner.js";
-import type { LLMTool, LLMProviderConfig } from "./llm-provider.js";
+import { streamOpenAICompatible, type LLMTool, type LLMProviderConfig } from "./llm-provider.js";
 import { queryPhones } from "./phone-monitor.js";
 import { renameConversation, getQrcode } from "./storage-service.js";
 import { pullQrCode } from "./send-helper.js";
 import { healthEvents, type HealthEvent } from "./health-events.js";
+import {
+  listProviders,
+  addProvider,
+  updateProvider,
+  deleteProvider,
+  setDefault,
+  getProvider,
+  getApiKeyPlain,
+  getDefaultProvider,
+  seedDefaultIfEmpty,
+  type LLMProviderRow,
+} from "./llm-providers-store.js";
 
 const PORT = parseInt(process.env.AGENT_BACKEND_PORT ?? "17800", 10);
 
@@ -360,9 +372,14 @@ export function startAgentBackend(opts: {
     next();
   });
 
-  // health
+  // health — provider 名: 优先看 DB 默认 (用户改过的), fallback 启动 seed
   app.get("/api/agent/health", (_req, res) => {
-    res.json({ status: "ok", provider: opts.defaultProvider?.name ?? "(未配置)" });
+    let providerName = opts.defaultProvider?.name ?? "(未配置)";
+    try {
+      const dp = getDefaultProvider();
+      if (dp) providerName = dp.name;
+    } catch { /* ignore */ }
+    res.json({ status: "ok", provider: providerName });
   });
 
   // GET /api/wework/accounts — 列出所有工作微信账号 (多账号下拉用)
@@ -660,7 +677,16 @@ export function startAgentBackend(opts: {
 
   // POST /api/agent/chat (SSE)
   app.post("/api/agent/chat", async (req: Request, res: Response) => {
-    if (!opts.defaultProvider) {
+    // 多 provider: 每次 chat 进来都从 DB 拿最新 default — 用户切了默认下一条 chat 立即生效
+    // (而不是 process 启动时定死的那条). DB 没记录时 fallback 到 opts.defaultProvider (启动 seed 已写入).
+    let activeProvider: LLMProviderConfig | null = null;
+    try {
+      activeProvider = getDefaultProvider();
+    } catch (e) {
+      opts.logger.error(`[agent/chat] getDefaultProvider 失败: ${e instanceof Error ? e.message : e}`);
+    }
+    if (!activeProvider) activeProvider = opts.defaultProvider;
+    if (!activeProvider) {
       res.status(503).json({ code: -1, msg: "LLM provider 未配置" });
       return;
     }
@@ -698,7 +724,7 @@ export function startAgentBackend(opts: {
       const chatReq: ChatRequest = {
         sessionId,
         messages: req.body.messages ?? [],
-        llmProvider: opts.defaultProvider,
+        llmProvider: activeProvider,
         context: ctx,
         tools: TOOL_SCHEMAS,
       };
@@ -782,29 +808,194 @@ export function startAgentBackend(opts: {
     req.on("error", cleanup);
   });
 
-  app.get("/api/llm/providers", (_req, res) => {
-    // 当前只支持单 provider (从启动配置). 后续可加 DB 存多个.
-    if (!opts.defaultProvider) {
-      res.json({ code: 0, msg: "ok", data: [] });
-      return;
+  // ============================================
+  // LLM Provider 真持久化 — 走 SQLite llm_providers 表
+  // 启动时如果 DB 空, 把 opts.defaultProvider seed 进去 (兼容老用户)
+  // ============================================
+  try {
+    if (seedDefaultIfEmpty(opts.defaultProvider)) {
+      opts.logger.info("[llm-providers] 表空, 已用启动 default provider seed 一条");
     }
-    const p = opts.defaultProvider;
-    res.json({
-      code: 0,
-      msg: "ok",
-      data: [
-        {
-          id: p.id,
-          type: p.type,
-          name: p.name,
-          baseUrl: p.baseUrl,
-          model: p.model,
-          keyPreview: p.apiKey.slice(0, 8) + "***",
-          isDefault: true,
-          enabled: true,
-        },
-      ],
-    });
+  } catch (e) {
+    opts.logger.error(`[llm-providers] seed 失败: ${e instanceof Error ? e.message : e}`);
+  }
+
+  /** DB row → 前端公开格式 (apiKey 永远不返完整, 只给 keyPreview 前 8 位) */
+  function rowToPublic(row: LLMProviderRow): Record<string, unknown> {
+    // 注: keyPreview 由密文头几位构成 — 但密文是随机 IV 开头的 base64, 不能直接展示.
+    // 所以解密后取明文前 8 位; 解密失败兜底显示 "***".
+    let keyPreview = "***";
+    const plain = getApiKeyPlain(row);
+    if (plain && plain.length > 0) {
+      keyPreview = plain.slice(0, Math.min(8, plain.length)) + "***";
+    } else if (plain === "") {
+      keyPreview = "(无 key)";
+    }
+    return {
+      id: row.id,
+      type: row.type,
+      name: row.name,
+      baseUrl: row.baseUrl,
+      model: row.model,
+      keyPreview,
+      isDefault: row.isDefault,
+      enabled: row.enabled,
+      createdAt: row.createdAt,
+    };
+  }
+
+  // GET /api/llm/providers — 列表 (前端 SettingsView onMounted 拉)
+  app.get("/api/llm/providers", (_req, res) => {
+    try {
+      const rows = listProviders();
+      res.json({ code: 0, msg: "ok", data: rows.map(rowToPublic) });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      opts.logger.error(`[api/llm/providers GET] ${msg}`);
+      res.status(500).json({ code: -1, msg });
+    }
+  });
+
+  // POST /api/llm/providers — 添加; body { type, name, baseUrl, model, apiKey, isDefault? }
+  app.post("/api/llm/providers", (req, res) => {
+    try {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const type = String(body.type ?? "").trim();
+      const name = String(body.name ?? "").trim();
+      const baseUrl = String(body.baseUrl ?? "").trim();
+      const model = String(body.model ?? "").trim();
+      const apiKey = String(body.apiKey ?? "");
+      const isDefault = body.isDefault === true || body.isDefault === "true";
+
+      if (!type || !name || !baseUrl || !model) {
+        res.status(400).json({ code: -1, msg: "type / name / baseUrl / model 必填" });
+        return;
+      }
+      const row = addProvider({ type, name, baseUrl, model, apiKey, isDefault });
+      res.json({ code: 0, msg: "ok", data: rowToPublic(row) });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      opts.logger.error(`[api/llm/providers POST] ${msg}`);
+      res.status(500).json({ code: -1, msg });
+    }
+  });
+
+  // PUT /api/llm/providers/:id — 局部更新 (apiKey 字段传了才重新加密; 不传保留原 key)
+  app.put("/api/llm/providers/:id", (req, res) => {
+    try {
+      const id = req.params.id;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const patch: Parameters<typeof updateProvider>[1] = {};
+      if (typeof body.type === "string") patch.type = body.type;
+      if (typeof body.name === "string") patch.name = body.name;
+      if (typeof body.baseUrl === "string") patch.baseUrl = body.baseUrl;
+      if (typeof body.model === "string") patch.model = body.model;
+      if (typeof body.apiKey === "string") patch.apiKey = body.apiKey;
+      if (typeof body.enabled === "boolean") patch.enabled = body.enabled;
+      if (typeof body.isDefault === "boolean") patch.isDefault = body.isDefault;
+
+      const row = updateProvider(id, patch);
+      if (!row) {
+        res.status(404).json({ code: -1, msg: "provider 不存在" });
+        return;
+      }
+      res.json({ code: 0, msg: "ok", data: rowToPublic(row) });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      opts.logger.error(`[api/llm/providers PUT] ${msg}`);
+      res.status(500).json({ code: -1, msg });
+    }
+  });
+
+  // DELETE /api/llm/providers/:id — 不允许删默认的
+  app.delete("/api/llm/providers/:id", (req, res) => {
+    try {
+      const id = req.params.id;
+      const r = deleteProvider(id);
+      if (r.deleted === 0) {
+        const code = r.reason === "is_default" ? 400 : 404;
+        const msg = r.reason === "is_default" ? "不能删除默认 provider" : "provider 不存在";
+        res.status(code).json({ code: -1, msg });
+        return;
+      }
+      res.json({ code: 0, msg: "ok", data: { id } });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      opts.logger.error(`[api/llm/providers DELETE] ${msg}`);
+      res.status(500).json({ code: -1, msg });
+    }
+  });
+
+  // POST /api/llm/providers/:id/default — 设默认
+  app.post("/api/llm/providers/:id/default", (req, res) => {
+    try {
+      const id = req.params.id;
+      const ok = setDefault(id);
+      if (!ok) {
+        res.status(404).json({ code: -1, msg: "provider 不存在" });
+        return;
+      }
+      res.json({ code: 0, msg: "ok", data: { id, isDefault: true } });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      opts.logger.error(`[api/llm/providers/:id/default] ${msg}`);
+      res.status(500).json({ code: -1, msg });
+    }
+  });
+
+  // POST /api/llm/providers/:id/test — 简单 ping (调一下 chat 接口验证可达 + 凭据)
+  app.post("/api/llm/providers/:id/test", async (req, res) => {
+    try {
+      const id = req.params.id;
+      const row = getProvider(id);
+      if (!row) {
+        res.status(404).json({ code: -1, msg: "provider 不存在" });
+        return;
+      }
+      const apiKey = getApiKeyPlain(row);
+      if (apiKey === null) {
+        res.json({ code: -1, msg: "API key 解密失败 (OPENCLAW_SECRET 可能改了)" });
+        return;
+      }
+      if (!apiKey) {
+        res.json({ code: -1, msg: "未配置 API key" });
+        return;
+      }
+      // 拼成 LLMProviderConfig 喂给 streamOpenAICompatible (只跑 1 个最小 prompt)
+      const cfg: LLMProviderConfig = {
+        id: row.id,
+        type:
+          row.type === "claude" || row.type === "anthropic" ? "anthropic" : "openai_compatible",
+        name: row.name,
+        baseUrl: row.baseUrl,
+        apiKey,
+        model: row.model,
+      };
+      const ac = new AbortController();
+      const timeout = setTimeout(() => ac.abort(), 10_000);
+      try {
+        let gotAny = false;
+        for await (const _delta of streamOpenAICompatible(
+          cfg,
+          [{ role: "user", content: "ping" }],
+          undefined,
+          ac.signal,
+        )) {
+          gotAny = true;
+          break; // 拿到第一个 delta 就当通了
+        }
+        res.json({ code: 0, msg: "ok", data: { ok: true, gotAny } });
+      } catch (e) {
+        const errMsg = e instanceof Error ? e.message : String(e);
+        res.json({ code: -1, msg: errMsg, data: { ok: false } });
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      opts.logger.error(`[api/llm/providers/:id/test] ${msg}`);
+      res.status(500).json({ code: -1, msg });
+    }
   });
 
   const server = http.createServer(app);

@@ -32,7 +32,10 @@ import {
 } from "../services/send-helper.js";
 import type { SendResult } from "../services/send-helper.js";
 import { makeTool, type ToolResult } from "../openclaw-compat.js";
-import { clearSendMessageResult, takeSendMessageResult } from "../services/storage-service.js";
+import {
+  clearSendMessageResult, takeSendMessageResult,
+  awaitTaskResult, clearTaskResult,
+} from "../services/storage-service.js";
 
 /** 把 SendResult 转为 OpenClaw Tool 的标准返回格式 */
 function toToolResult(result: SendResult, successMsg: string): ToolResult {
@@ -150,15 +153,35 @@ export function registerMessageTools(api: OpenClawPluginApi) {
   // --------------------------------------------------
   api.registerTool(makeTool({
     name: "wework_revoke_message",
-    description: "撤回已发送的企业微信消息",
+    description: "撤回已发送的企业微信消息 (await TaskResultNotice 真回执, 8s 超时强否定)",
     parameters: Type.Object({
       wxId: Type.String({ description: "企业微信ID" }),
       msgId: Type.String({ description: "要撤回的消息ID" }),
       convId: Type.String({ description: "会话ID" }),
     }),
     async execute(_id, params) {
+      // 撤回是不可逆 + 高敏感操作 (对方可能已读), 必须 await 真回执. 超时按错误处理避免 LLM 重试连发.
       const result = revokeMessage(params.wxId, params.msgId, params.convId);
-      return toToolResult(result, `消息 ${params.msgId} 已撤回`);
+      if (!result.success || !result.taskId) {
+        return { content: [{ type: "text" as const, text: `撤回指令发送失败: ${result.error ?? "未知"}` }], details: {}, isError: true };
+      }
+      // await TaskResultNotice (按 TaskId 匹配)
+      const r = await awaitTaskResult(params.wxId, result.taskId, 8000);
+      if (!r) {
+        return {
+          content: [{ type: "text" as const, text: `❌ 撤回未确认: 8s 内手机端无 TaskResultNotice 回执. **不能算成功!** 大概率手机离线 / msgId 已过期 (>2min) / 不是自己发的消息. 不要重复执行避免被风控.` }],
+          details: {},
+          isError: true,
+        };
+      }
+      if (r.success) {
+        return { content: [{ type: "text" as const, text: `✅ 消息 ${params.msgId} 已撤回 (taskId=${result.taskId})` }], details: {} };
+      }
+      return {
+        content: [{ type: "text" as const, text: `❌ 撤回失败 (手机端拒绝): code=${r.code} ${r.errMsg || "未知"}. 常见原因: 超过 2 分钟撤回时限 / 不是自己发的 / msgId 错误.` }],
+        details: {},
+        isError: true,
+      };
     },
   }));
 
@@ -206,11 +229,25 @@ export function registerMessageTools(api: OpenClawPluginApi) {
           params.toConvId,
         );
       }
-
-      return toToolResult(
-        result,
-        `${msgIds.length}条消息已转发到会话 ${params.toConvId}`,
-      );
+      if (!result.success || !result.taskId) {
+        return toToolResult(result, `${msgIds.length}条消息已转发到会话 ${params.toConvId}`);
+      }
+      // await 真回执 — 转发是 mutation, 但语义上目标会话能否接收以及内容是否完整都需手机端确认
+      const r = await awaitTaskResult(params.wxId, result.taskId, 10000);
+      if (!r) {
+        return {
+          content: [{ type: "text" as const, text: `⏳ 转发指令已下发但 10s 内手机端没回 TaskResultNotice. 不能算成功也不能算失败 — 媒体类消息 SDK 上传慢. 用 wework_get_history 查目标会话最近一条确认.` }],
+          details: {},
+        };
+      }
+      if (r.success) {
+        return { content: [{ type: "text" as const, text: `✅ ${msgIds.length}条消息已转发到会话 ${params.toConvId} (taskId=${result.taskId})` }], details: {} };
+      }
+      return {
+        content: [{ type: "text" as const, text: `❌ 转发失败 (手机端拒绝): code=${r.code} ${r.errMsg || "未知"}` }],
+        details: {},
+        isError: true,
+      };
     },
   }));
 

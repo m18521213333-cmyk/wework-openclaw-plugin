@@ -513,15 +513,17 @@ export function listPhoneStatusEvents(wxId?: string, limit = 50): any[] {
  */
 export function getRecentMediaFromSender(wxId: string, senderId: string, withinMinutes = 30, limit = 10): any[] {
   const db = getDb();
+  // P2 #20: withinMinutes 安全化 — 强制 int 范围 + 走绑定参数 (字符串拼接 SQLite datetime modifier)
+  const minsInt = Math.max(1, Math.min(60 * 24 * 30, Math.floor(Number(withinMinutes) || 30)));
   const rows = db.prepare(`
     SELECT content_type, content, msg_id, is_send, datetime(created_at, 'localtime') AS ts
     FROM messages
     WHERE wx_id=? AND sender_id=?
       AND content_type IN ('Picture', 'Voice', 'Video', 'File', '2', '3', '4', '5')
-      AND created_at > datetime('now', '-${withinMinutes} minutes')
+      AND created_at > datetime('now', '-' || ? || ' minutes')
     ORDER BY id DESC
     LIMIT ?
-  `).all(wxId, senderId, limit) as any[];
+  `).all(wxId, senderId, minsInt, limit) as any[];
 
   return rows.map((r) => {
     let url = "";
@@ -844,6 +846,141 @@ export function takeSendMessageResult(wxId: string, convId: string): SendMessage
 export function clearSendMessageResult(wxId: string, convId: string): void {
   const db = getDb();
   db.prepare(`DELETE FROM send_message_results WHERE wx_id=? AND conv_id=?`).run(wxId, convId);
+}
+
+// ============================================================================
+// 通用任务回执 — SQLite 持久 (TaskResultNotice / *TaskResultNotice WS push).
+// 跨进程 IPC: plugin server WS handler 写, CLI 子进程读.
+//
+// 适用场景: Java 后端绝大多数 mutation task 的回执都走通用 TaskResultNotice (proto type=1122),
+// 内含 TaskType + TaskId + Success + Code + ErrMsg + Ext + ExtId. 工具/CLI 发指令前先生成
+// 一个 taskId, 把结果按 (wx_id, task_id) 唯一持久化. 用得到的工具:
+//   - revoke (MsgRevokeTask)              → TaskResultNotice
+//   - chatroom_action kick/quit/dismiss   → TaskResultNotice (建群也走 ConversationAddNotice)
+//   - delete_customer                     → TaskResultNotice (任意 *CustomerTask 都是)
+//   - accept_customer / add_customer*     → TaskResultNotice
+//   - set_user_labels / *Label* CRUD      → TaskResultNotice + UserLabelModifyTaskResultNotice
+//   - sns_like / sns_comment / del_sns* / forward → TaskResultNotice (sns_comment 也有专属 105)
+//   - send_friend_verify                  → TaskResultNotice
+//
+// 设计原则: 一个表搞定 — 不按工具类型拆分子表. 因为关键字段全在 proto TaskResultNoticeMessage 里
+// 已经定义好 (TaskType 字段告诉我们这是哪种任务回的), 无需各搞一份 schema. 拆分子表只会徒增维护成本.
+// ============================================================================
+
+export interface TaskResult {
+  success: boolean;
+  errMsg?: string;
+  code?: number;
+  taskType?: string;
+  /** Ext / ExtId: 视任务类型语义不同 (建群=新群 ConvId; create_label=新 LabelId; ...) */
+  ext?: string;
+  extId?: string;
+  ts: number;
+}
+
+function ensureTaskResultsTable() {
+  const db = getDb();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS task_results (
+      wx_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      task_type TEXT,
+      success INTEGER NOT NULL,
+      err_msg TEXT,
+      code INTEGER,
+      ext TEXT,
+      ext_id TEXT,
+      ts INTEGER NOT NULL,
+      PRIMARY KEY (wx_id, task_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_results_ts ON task_results(ts);
+  `);
+}
+ensureTaskResultsTable();
+
+/** WS handler 写入 (TaskResultNotice 或 *TaskResultNotice) — plugin server 进程 */
+export function recordTaskResult(
+  wxId: string,
+  taskId: string,
+  success: boolean,
+  errMsg?: string,
+  code?: number,
+  taskType?: string,
+  ext?: string,
+  extId?: string,
+): void {
+  if (!taskId || taskId === "0") return; // 没 TaskId 就别写, 没法关联回工具
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO task_results (wx_id, task_id, task_type, success, err_msg, code, ext, ext_id, ts)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(wx_id, task_id) DO UPDATE SET
+      task_type=excluded.task_type, success=excluded.success, err_msg=excluded.err_msg,
+      code=excluded.code, ext=excluded.ext, ext_id=excluded.ext_id, ts=excluded.ts
+  `).run(
+    wxId, String(taskId), taskType ?? null,
+    success ? 1 : 0, errMsg ?? null, code ?? null,
+    ext ?? null, extId ?? null, Date.now(),
+  );
+}
+
+/** tool/CLI 读取并清掉 (一次消费). 没拿到回 null. */
+export function takeTaskResult(wxId: string, taskId: string | number): TaskResult | null {
+  if (!taskId) return null;
+  const db = getDb();
+  const tid = String(taskId);
+  const row = db.prepare(`
+    SELECT task_type, success, err_msg, code, ext, ext_id, ts FROM task_results
+    WHERE wx_id=? AND task_id=?
+  `).get(wxId, tid) as any;
+  if (!row) return null;
+  db.prepare(`DELETE FROM task_results WHERE wx_id=? AND task_id=?`).run(wxId, tid);
+  return {
+    success: row.success === 1,
+    errMsg: row.err_msg ?? undefined,
+    code: row.code ?? undefined,
+    taskType: row.task_type ?? undefined,
+    ext: row.ext ?? undefined,
+    extId: row.ext_id ?? undefined,
+    ts: row.ts,
+  };
+}
+
+/** 发送前清旧 (避免拿到上一次同 taskId 的脏数据). 一般 taskId=Date.now() 不会冲突, 防御性的. */
+export function clearTaskResult(wxId: string, taskId: string | number): void {
+  if (!taskId) return;
+  const db = getDb();
+  db.prepare(`DELETE FROM task_results WHERE wx_id=? AND task_id=?`).run(wxId, String(taskId));
+}
+
+/** 清除超过 ageHours 的 task_results 记录, 避免无限增长. */
+export function cleanupStaleTaskResults(ageHours: number = 24): number {
+  const db = getDb();
+  const cutoffMs = Date.now() - ageHours * 3600 * 1000;
+  const r = db.prepare(`DELETE FROM task_results WHERE ts < ?`).run(cutoffMs);
+  return r.changes;
+}
+
+/**
+ * 工具/CLI 通用 helper: 发完任务后等 task_results 表里出现某 taskId 的真回执.
+ * @param wxId      工作微信 ID
+ * @param taskId    本次任务的 TaskId (调用方在发指令前生成的, 一般 Date.now())
+ * @param timeoutMs 等待超时, 默认 8s
+ * @returns null 表示超时未拿到回执, 否则返回 TaskResult.
+ */
+export async function awaitTaskResult(
+  wxId: string,
+  taskId: string | number,
+  timeoutMs: number = 8000,
+): Promise<TaskResult | null> {
+  const start = Date.now();
+  const stepMs = 300;
+  while (Date.now() - start < timeoutMs) {
+    const r = takeTaskResult(wxId, taskId);
+    if (r) return r;
+    await new Promise((rr) => setTimeout(rr, stepMs));
+  }
+  return null;
 }
 
 /**

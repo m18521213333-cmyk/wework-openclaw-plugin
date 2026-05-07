@@ -26,12 +26,40 @@ import {
 } from "../services/send-helper.js";
 import type { SendResult } from "../services/send-helper.js";
 import { makeTool, type ToolResult } from "../openclaw-compat.js";
+import { awaitTaskResult } from "../services/storage-service.js";
 
 function toResult(r: SendResult, ok: string): ToolResult {
   if (r.success) {
     return { content: [{ type: "text" as const, text: ok }], details: {} };
   }
   return { content: [{ type: "text" as const, text: `操作失败: ${r.error}` }], details: {}, isError: true };
+}
+
+/** await TaskResultNotice 真回执. strict=true 时超时按错误处理. */
+async function awaitAndFormat(
+  wxId: string, result: SendResult,
+  successMsg: string, pendingHint: string,
+  timeoutMs = 8000, strict = false,
+): Promise<ToolResult> {
+  if (!result.success || !result.taskId) {
+    return { content: [{ type: "text" as const, text: `操作失败: ${result.error ?? "未知"}` }], details: {}, isError: true };
+  }
+  const r = await awaitTaskResult(wxId, result.taskId, timeoutMs);
+  if (!r) {
+    return {
+      content: [{ type: "text" as const, text: `${strict ? "❌" : "⏳"} ${strict ? "操作未确认" : "操作待确认"}: ${timeoutMs / 1000}s 内手机端无 TaskResultNotice 回执. ${pendingHint}` }],
+      details: {},
+      isError: strict,
+    };
+  }
+  if (r.success) {
+    return { content: [{ type: "text" as const, text: `✅ ${successMsg} (taskId=${result.taskId}${r.extId ? `, extId=${r.extId}` : ""})` }], details: {} };
+  }
+  return {
+    content: [{ type: "text" as const, text: `❌ 手机端拒绝: code=${r.code} ${r.errMsg || "未知"}` }],
+    details: {},
+    isError: true,
+  };
 }
 
 export function registerGroupTools(api: OpenClawPluginApi) {
@@ -87,7 +115,21 @@ export function registerGroupTools(api: OpenClawPluginApi) {
         set_notice: "发群公告",
         quit: "退出群聊",
       };
-      return toResult(r, `${actionLabels[params.action]}指令已发送`);
+      // 创建群聊有自己的 ConversationAddNotice / pending_tasks 流程, 不在这里 await
+      // (免得跟 CLI 的 send-after 流程冲突). 直接返回指令已发.
+      if (params.action === "create") {
+        return toResult(r, `${actionLabels[params.action]}指令已发送`);
+      }
+      // 踢人/退/解散 是不可逆 + 高风险, 必须 await 真回执. 超时强否定.
+      const isStrict = params.action === "remove_member" || params.action === "quit";
+      return awaitAndFormat(
+        params.wxId, r,
+        `${actionLabels[params.action]}已确认 (${params.action})`,
+        isStrict
+          ? `**${actionLabels[params.action]}不能算成功!** 不要重发. 用 wework_get_group_members 复查群成员.`
+          : `8s 内 SDK 没回. 用 wework_get_group_members 复查群状态.`,
+        8000, isStrict,
+      );
     },
   }));
 
@@ -123,7 +165,13 @@ export function registerGroupTools(api: OpenClawPluginApi) {
     }),
     async execute(_id, params) {
       const r = createLabel(params.wxId, params.labelName);
-      return toResult(r, `标签创建指令已发送: "${params.labelName}"`);
+      // 创建标签是 mutation, 但失败可重试 (无副作用). 超时中性 — LLM 用 wework_sync_labels 复查.
+      return awaitAndFormat(
+        params.wxId, r,
+        `标签 "${params.labelName}" 已创建`,
+        `8s 内无 UserLabelModifyTaskResultNotice 回执. 用 wework_sync_labels + 看推送列表确认.`,
+        8000, false,
+      );
     },
   }));
 
@@ -141,7 +189,13 @@ export function registerGroupTools(api: OpenClawPluginApi) {
     }),
     async execute(_id, params) {
       const r = deleteLabel(params.wxId, params.labelId);
-      return toResult(r, `标签 ${params.labelId} 删除指令已发送`);
+      // 删标签是不可逆 mutation, 但客户身上的 label 关系会一并消失. 超时中性 (实测 SDK 推 push 较慢).
+      return awaitAndFormat(
+        params.wxId, r,
+        `标签 ${params.labelId} 已删除`,
+        `8s 内无回执. 用 wework_sync_labels 复查列表.`,
+        8000, false,
+      );
     },
   }));
 
@@ -160,9 +214,11 @@ export function registerGroupTools(api: OpenClawPluginApi) {
     }),
     async execute(_id, params) {
       const r = modifyLabel(params.wxId, params.labelId, params.labelName);
-      return toResult(
-        r,
-        `标签 ${params.labelId} 重命名为 "${params.labelName}" 指令已发送`,
+      return awaitAndFormat(
+        params.wxId, r,
+        `标签 ${params.labelId} 已重命名为 "${params.labelName}"`,
+        `8s 内无 UserLabelModifyTaskResultNotice 回执. 用 wework_sync_labels 复查.`,
+        8000, false,
       );
     },
   }));
@@ -184,9 +240,12 @@ export function registerGroupTools(api: OpenClawPluginApi) {
     }),
     async execute(_id, params) {
       const r = setUserLabels(params.wxId, params.remoteId, params.labelIds);
-      return toResult(
-        r,
-        `用户 ${params.remoteId} 标签设置已发送: [${params.labelIds.join(",")}]`,
+      // 给用户打标签是 LLM 误操作高发场景 (一句话理解偏差). 超时中性 — LLM 用 wework_get_contact 复查.
+      return awaitAndFormat(
+        params.wxId, r,
+        `用户 ${params.remoteId} 标签已设置: [${params.labelIds.join(",")}]`,
+        `8s 内无回执. 用 wework_get_contact 复查 ${params.remoteId} 当前 labelIds.`,
+        8000, false,
       );
     },
   }));

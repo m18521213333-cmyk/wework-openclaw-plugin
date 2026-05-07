@@ -41,7 +41,7 @@ import { startAgentBackend } from "./services/agent-backend.js";
 import type { LLMProviderConfig } from "./services/llm-provider.js";
 import type { Server as HttpServer } from "node:http";
 import { handleAiCommand } from "./services/ai-command.js";
-import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getResolvedMediaStatus, clearResolvedMediaRecord, isTransientResolveError, getMessageMeta, upsertMoment, listMoments, getMomentBySnsId, upsertMomentsTask, listMomentsTasks, upsertQrcode, recordPostMomentsResult, recordSendMessageResult, clearSendMessageResult, takeSendMessageResult, clearPostMomentsResult, takePostMomentsResult } from "./services/storage-service.js";
+import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getResolvedMediaStatus, clearResolvedMediaRecord, isTransientResolveError, getMessageMeta, upsertMoment, listMoments, getMomentBySnsId, upsertMomentsTask, listMomentsTasks, upsertQrcode, recordPostMomentsResult, recordSendMessageResult, clearSendMessageResult, takeSendMessageResult, clearPostMomentsResult, takePostMomentsResult, recordTaskResult, takeTaskResult, clearTaskResult, awaitTaskResult, cleanupStaleTaskResults } from "./services/storage-service.js";
 
 // send-helper (CLI 直接调用)
 // 子进程模式下 Java pluginbot-cli 经常被互踢, 所有 send 路径都走 withRetry 版.
@@ -377,6 +377,37 @@ export default definePluginEntry({
               }
             }
 
+            // ========================================================================
+            // 通用任务回执 (TaskResultNotice + 各种 *TaskResultNotice 共享落 task_results 表)
+            // 解决 fire-and-forget 假成功问题. 所有以 TaskId 关联的 mutation 任务都走这里:
+            //   revoke / chatroom_action(踢人/退/解散) / delete_customer / accept_customer
+            //   add_customer* / set_user_labels / *Label* CRUD / sns_like / sns_comment
+            //   del_sns / del_sns_comment / forward / send_friend_verify
+            // ========================================================================
+            if (
+              msgType === "TaskResultNotice" ||
+              msgType === "UserLabelModifyTaskResultNotice" ||
+              msgType === "SnsCommentTaskResultNotice" ||
+              msgType === "GetContactInfoTaskResultNotice" ||
+              msgType === "SearchMsgTaskResultNotice"
+            ) {
+              const wxId = String(content.WxId ?? (content as any).wxId ?? "");
+              const taskId = String(content.TaskId ?? (content as any).taskId ?? "");
+              if (wxId && taskId && taskId !== "0") {
+                const success = (content.Success ?? (content as any).success) === true;
+                const code = Number(content.Code ?? (content as any).code ?? 0);
+                const errMsg = String(content.ErrMsg ?? (content as any).errMsg ?? "");
+                // TaskType 字段在 TaskResultNotice (proto 1122) 上有, 其他子 *TaskResultNotice 没;
+                // 后者直接用 msgType 自身做 taskType 标识.
+                const tt = (content.TaskType ?? (content as any).taskType);
+                const taskType = (tt != null && tt !== "" && tt !== 0) ? String(tt) : msgType;
+                const ext = content.Ext != null ? String(content.Ext) : (content as any).ext != null ? String((content as any).ext) : undefined;
+                const extId = content.ExtId != null ? String(content.ExtId) : (content as any).extId != null ? String((content as any).extId) : undefined;
+                recordTaskResult(wxId, taskId, success, errMsg, code, taskType, ext, extId);
+                logger.info(`[TaskResult] ${msgType} wxId=${wxId} taskId=${taskId} type=${taskType} success=${success} code=${code} err=${errMsg.slice(0, 60)}`);
+              }
+            }
+
             // 管理员朋友圈任务列表 → 落 SQLite moments_tasks 表
             // 解决 fire-and-forget: tool/CLI 发完 PullSnsTaskListTask 立即拿不到数据,
             // 这里 WS push 进来后写库, tool/CLI 等几秒再读 SQLite 拿到.
@@ -503,11 +534,15 @@ export default definePluginEntry({
           }
         });
 
-        // 每小时清理一次超过 24 小时还在 pending 的任务
+        // 每小时清理一次超过 24 小时还在 pending 的任务 / 老的 task_results 回执
         setInterval(() => {
           try {
             const n = cleanupStalePendingTasks(24);
             if (n > 0) logger.info(`[PendingTask] 清理 ${n} 个 stale 任务`);
+          } catch {}
+          try {
+            const n = cleanupStaleTaskResults(24);
+            if (n > 0) logger.info(`[TaskResult] 清理 ${n} 个 stale 回执`);
           } catch {}
         }, 3600 * 1000);
 
@@ -1194,12 +1229,20 @@ export default definePluginEntry({
 
       // --- 联系人信息 ---
       ww.command("contact")
-        .description("查询联系人")
+        .description("查询联系人 (await GetContactInfoTaskResultNotice 真回执)")
         .argument("<wxId>", "企业微信ID")
         .argument("<remoteId>", "联系人ID")
         .action(withConnection(async (wxId: string, remoteId: string) => {
           const r = getContactInfo(wxId, remoteId);
-          console.log(r.success ? `✅ 查询已发送: ${remoteId}` : `❌ ${r.error}`);
+          if (!r.success) { console.log(`❌ ${r.error}`); return; }
+          if (!r.taskId) { console.log(`✅ 查询已发送: ${remoteId}`); return; }
+          const tr = await awaitTaskResult(wxId, r.taskId, 6000);
+          if (!tr) {
+            console.log(`⏳ 查询已发送但 6s 内 SDK 没回 GetContactInfoTaskResultNotice. 数据可能稍后到达.`);
+            return;
+          }
+          if (tr.success) console.log(`✅ 联系人查询已确认: ${remoteId} (Ext=${tr.ext ?? ""}, ExtId=${tr.extId ?? ""})`);
+          else console.log(`❌ 查询失败: code=${tr.code} ${tr.errMsg || "未知"}`);
         }));
 
       // --- 群发 --- (走重试: 同 send 命令理由)
@@ -1260,6 +1303,26 @@ export default definePluginEntry({
             return;
           }
           console.log(`✅ 群操作 ${action} 已发送 (TaskId=${r.taskId})`);
+
+          // 非 create 操作 (踢人/退/解散/改名/公告/拉人) → await TaskResultNotice 真回执
+          // create 走 ConversationAddNotice 路径 (建群下面就是 send-after 流程), 这里跳过.
+          if (action !== "create" && r.taskId) {
+            const isStrict = action === "remove_member" || action === "kick" ||
+                             action === "quit" || action === "exit";
+            const tr = await awaitTaskResult(wxId, r.taskId, 8000);
+            if (!tr) {
+              console.log(
+                isStrict
+                  ? `❌ ${action} 未确认: 8s 内无 TaskResultNotice 回执. 不能算成功 — 不要重发. 用 wework history ${wxId} ${opts.group ?? ""} 看最近群消息复查.`
+                  : `⏳ ${action} 待确认: 8s 内无 TaskResultNotice 回执. 用 wework history 复查群状态.`
+              );
+            } else if (tr.success) {
+              console.log(`✅ ${action} 已确认 (taskId=${r.taskId})`);
+            } else {
+              console.log(`❌ ${action} 失败 (手机端拒绝): code=${tr.code} ${tr.errMsg || "未知"}`);
+            }
+          }
+
           // 建群+欢迎消息流程: 通过 SQLite IPC 委托给 service 进程执行
           // (CLI 是短期进程, ConversationAddNotice 推给 service 不是 CLI, 所以 CLI 等不到)
           if (action === "create" && opts.sendAfter && r.taskId && opts.content) {
@@ -1485,25 +1548,48 @@ export default definePluginEntry({
 
       // --- 撤回消息 ---
       ww.command("revoke")
-        .description("撤回已发出的消息")
+        .description("撤回已发出的消息 (await TaskResultNotice 真回执, 8s 超时强否定)")
         .argument("<wxId>", "企业微信ID")
         .argument("<msgId>", "消息ID (从 history 拉到的 MsgId)")
         .argument("<convId>", "会话ID")
         .action(withConnection(async (wxId: string, msgId: string, convId: string) => {
           const r = await revokeMessageWithRetry(wxId, msgId, convId);
-          console.log(r.success ? `✅ 撤回指令已发送 (msg=${msgId})` : `❌ ${r.error}`);
+          if (!r.success) { console.log(`❌ ${r.error}`); return; }
+          if (!r.taskId) { console.log(`✅ 撤回指令已发送 (msg=${msgId}) — 旧路径无 TaskId, 无法 await`); return; }
+          // await TaskResultNotice 真回执
+          const tr = await awaitTaskResult(wxId, r.taskId, 8000);
+          if (!tr) {
+            console.log(`❌ 撤回未确认: 8s 内手机端无回执. 大概率手机离线 / msgId 已过期 (>2min) / 不是自己发的消息. 不能算成功 — 不要重试.`);
+            return;
+          }
+          if (tr.success) {
+            console.log(`✅ 消息 ${msgId} 已撤回 (taskId=${r.taskId})`);
+          } else {
+            console.log(`❌ 撤回失败 (手机端拒绝): code=${tr.code} ${tr.errMsg || "未知"}`);
+          }
         }));
 
       // --- 转发消息 ---
       ww.command("forward")
-        .description("转发消息到另一个会话")
+        .description("转发消息到另一个会话 (await TaskResultNotice 真回执)")
         .argument("<wxId>", "企业微信ID")
         .argument("<msgId>", "要转发的消息ID")
         .argument("<fromConvId>", "源会话ID")
         .argument("<toConvId>", "目标会话ID")
         .action(withConnection(async (wxId: string, msgId: string, fromConvId: string, toConvId: string) => {
           const r = await forwardMessageWithRetry(wxId, msgId, fromConvId, toConvId);
-          console.log(r.success ? `✅ 转发指令已发送 (${fromConvId} → ${toConvId})` : `❌ ${r.error}`);
+          if (!r.success) { console.log(`❌ ${r.error}`); return; }
+          if (!r.taskId) { console.log(`✅ 转发指令已发送 (${fromConvId} → ${toConvId})`); return; }
+          const tr = await awaitTaskResult(wxId, r.taskId, 10000);
+          if (!tr) {
+            console.log(`⏳ 转发指令已下发但 10s 内手机端没回. 媒体类消息 SDK 上传慢, 用 wework history ${wxId} ${toConvId} 查目标会话最近一条确认.`);
+            return;
+          }
+          if (tr.success) {
+            console.log(`✅ 转发已确认 (${fromConvId} → ${toConvId}, taskId=${r.taskId})`);
+          } else {
+            console.log(`❌ 转发失败 (手机端拒绝): code=${tr.code} ${tr.errMsg || "未知"}`);
+          }
         }));
 
       // --- 上传本地文件 → 拽 URL ---
@@ -1570,88 +1656,131 @@ export default definePluginEntry({
 
       // --- 加好友 ---
       ww.command("add-customer")
-        .description("发送好友请求")
+        .description("发送好友请求 (await TaskResultNotice 真回执)")
         .argument("<wxId>", "企业微信ID")
         .argument("<remoteId>", "目标客户 RemoteId")
         .option("-v, --verify <content>", "验证消息", "你好")
         .action(withConnection(async (wxId: string, remoteId: string, opts: { verify?: string }) => {
           const r = addCustomerById(wxId, remoteId, opts.verify);
-          console.log(r.success ? `✅ 加好友请求已发送 → ${remoteId}` : `❌ ${r.error}`);
+          if (!r.success) { console.log(`❌ ${r.error}`); return; }
+          if (!r.taskId) { console.log(`✅ 加好友请求已发送 → ${remoteId}`); return; }
+          const tr = await awaitTaskResult(wxId, r.taskId, 8000);
+          if (!tr) { console.log(`⏳ 8s 内 SDK 没回 — 加好友是异步动作 (对方需确认), 不一定失败. 用 wework contact ${wxId} ${remoteId} 复查.`); return; }
+          if (tr.success) console.log(`✅ 加好友请求已确认 → ${remoteId} (taskId=${r.taskId})`);
+          else console.log(`❌ 加好友失败: code=${tr.code} ${tr.errMsg || "未知"}`);
         }));
 
       // --- 通过好友请求 ---
       ww.command("accept-customer")
-        .description("通过好友请求")
+        .description("通过好友请求 (await TaskResultNotice 真回执)")
         .argument("<wxId>", "企业微信ID")
         .argument("<remoteId>", "待接受客户 RemoteId")
         .action(withConnection(async (wxId: string, remoteId: string) => {
           const r = acceptCustomer(wxId, remoteId);
-          console.log(r.success ? `✅ 已通过好友请求: ${remoteId}` : `❌ ${r.error}`);
+          if (!r.success) { console.log(`❌ ${r.error}`); return; }
+          if (!r.taskId) { console.log(`✅ 已通过好友请求: ${remoteId}`); return; }
+          const tr = await awaitTaskResult(wxId, r.taskId, 8000);
+          if (!tr) { console.log(`⏳ 8s 内 SDK 没回. 用 wework contact ${wxId} ${remoteId} 复查是否已成为联系人.`); return; }
+          if (tr.success) console.log(`✅ 已通过好友请求: ${remoteId} (taskId=${r.taskId})`);
+          else console.log(`❌ 通过失败: code=${tr.code} ${tr.errMsg || "未知"}`);
         }));
 
       // --- 获取外部用户ID ---
       ww.command("get-ext-user-id")
-        .description("获取客户 external user id")
+        .description("获取客户 external user id (await TaskResultNotice, 结果在 ext 字段)")
         .argument("<wxId>", "企业微信ID")
         .argument("<remoteId>", "客户 RemoteId")
         .action(withConnection(async (wxId: string, remoteId: string) => {
           const r = getExtUserId(wxId, remoteId);
-          console.log(r.success ? `✅ 获取 ExtUserId 已发送: ${remoteId}` : `❌ ${r.error}`);
+          if (!r.success) { console.log(`❌ ${r.error}`); return; }
+          if (!r.taskId) { console.log(`✅ 获取 ExtUserId 已发送: ${remoteId}`); return; }
+          const tr = await awaitTaskResult(wxId, r.taskId, 6000);
+          if (!tr) { console.log(`⏳ 6s 内 SDK 没回.`); return; }
+          if (tr.success) console.log(`✅ ExtUserId 查询已确认: ${remoteId} → ext=${tr.ext ?? ""} extId=${tr.extId ?? ""}`);
+          else console.log(`❌ 查询失败: code=${tr.code} ${tr.errMsg || "未知"}`);
         }));
 
       // --- 设置备注 ---
       ww.command("set-memo")
-        .description("设置客户备注")
+        .description("设置客户备注 (await TaskResultNotice 真回执)")
         .argument("<wxId>", "企业微信ID")
         .argument("<remoteId>", "客户 RemoteId")
         .argument("<memo>", "备注内容")
         .action(withConnection(async (wxId: string, remoteId: string, memo: string) => {
           const r = setUserMemo(wxId, remoteId, memo);
-          console.log(r.success ? `✅ 备注已设置: ${remoteId} → "${memo}"` : `❌ ${r.error}`);
+          if (!r.success) { console.log(`❌ ${r.error}`); return; }
+          if (!r.taskId) { console.log(`✅ 备注已设置: ${remoteId} → "${memo}"`); return; }
+          const tr = await awaitTaskResult(wxId, r.taskId, 8000);
+          if (!tr) { console.log(`⏳ 8s 内 SDK 没回. 用 wework contact ${wxId} ${remoteId} 复查.`); return; }
+          if (tr.success) console.log(`✅ 备注已设置: ${remoteId} → "${memo}" (taskId=${r.taskId})`);
+          else console.log(`❌ 备注设置失败: code=${tr.code} ${tr.errMsg || "未知"}`);
         }));
 
       // --- 给客户打标签 ---
       ww.command("set-user-labels")
-        .description("给客户打标签")
+        .description("给客户打标签 (await TaskResultNotice 真回执)")
         .argument("<wxId>", "企业微信ID")
         .argument("<remoteId>", "客户 RemoteId")
         .option("--label-ids <ids...>", "标签 ID 列表")
         .action(withConnection(async (wxId: string, remoteId: string, opts: { labelIds?: string[] }) => {
           if (!opts.labelIds?.length) { console.log("❌ 请指定 --label-ids <标签ID列表>"); return; }
           const r = setUserLabels(wxId, remoteId, opts.labelIds);
-          console.log(r.success ? `✅ 标签已设置: ${remoteId} → [${opts.labelIds.join(",")}]` : `❌ ${r.error}`);
+          if (!r.success) { console.log(`❌ ${r.error}`); return; }
+          if (!r.taskId) { console.log(`✅ 标签已设置: ${remoteId} → [${opts.labelIds.join(",")}]`); return; }
+          const tr = await awaitTaskResult(wxId, r.taskId, 8000);
+          if (!tr) { console.log(`⏳ 8s 内 SDK 没回. 用 wework contact ${wxId} ${remoteId} 复查 labelIds.`); return; }
+          if (tr.success) console.log(`✅ 标签已确认: ${remoteId} → [${opts.labelIds.join(",")}] (taskId=${r.taskId})`);
+          else console.log(`❌ 打标签失败: code=${tr.code} ${tr.errMsg || "未知"}`);
         }));
 
       // --- 朋友圈点赞 ---
       ww.command("sns-like")
-        .description("给朋友圈动态点赞")
+        .description("给朋友圈动态点赞 (await TaskResultNotice 真回执)")
         .argument("<wxId>", "企业微信ID")
         .argument("<snsId>", "朋友圈动态ID")
         .action(withConnection(async (wxId: string, snsId: string) => {
           const r = snsLike(wxId, snsId);
-          console.log(r.success ? `✅ 点赞已发送: ${snsId}` : `❌ ${r.error}`);
+          if (!r.success) { console.log(`❌ ${r.error}`); return; }
+          if (!r.taskId) { console.log(`✅ 点赞已发送: ${snsId}`); return; }
+          const tr = await awaitTaskResult(wxId, r.taskId, 8000);
+          if (!tr) { console.log(`⏳ 8s 内 SDK 没回. 用 wework sns-data ${wxId} ${snsId} 复查点赞列表.`); return; }
+          if (tr.success) console.log(`✅ 点赞已确认: ${snsId} (taskId=${r.taskId})`);
+          else console.log(`❌ 点赞失败: code=${tr.code} ${tr.errMsg || "未知"}`);
         }));
 
       // --- 朋友圈评论 ---
       ww.command("sns-comment")
-        .description("评论朋友圈动态")
+        .description("评论朋友圈动态 (await TaskResultNotice/SnsCommentTaskResultNotice 真回执)")
         .argument("<wxId>", "企业微信ID")
         .argument("<snsId>", "朋友圈动态ID")
         .argument("<content>", "评论内容")
         .option("--reply-to <commentId>", "回复某条评论的ID")
         .action(withConnection(async (wxId: string, snsId: string, content: string, opts: { replyTo?: string }) => {
           const r = snsComment(wxId, snsId, content, opts.replyTo);
-          console.log(r.success ? `✅ 评论已发送: ${snsId}` : `❌ ${r.error}`);
+          if (!r.success) { console.log(`❌ ${r.error}`); return; }
+          if (!r.taskId) { console.log(`✅ 评论已发送: ${snsId}`); return; }
+          const tr = await awaitTaskResult(wxId, r.taskId, 8000);
+          if (!tr) { console.log(`⏳ 8s 内 SDK 没回. 用 wework sns-data ${wxId} ${snsId} 复查评论列表.`); return; }
+          if (tr.success) console.log(`✅ 评论已确认: ${snsId} (taskId=${r.taskId})`);
+          else console.log(`❌ 评论失败: code=${tr.code} ${tr.errMsg || "未知"}`);
         }));
 
       // --- 删除朋友圈 ---
       ww.command("delete-sns")
-        .description("删除自己发的朋友圈动态")
+        .description("删除自己发的朋友圈动态 (不可逆 — await TaskResultNotice, 8s 超时强否定)")
         .argument("<wxId>", "企业微信ID")
         .argument("<snsId>", "朋友圈动态ID")
         .action(withConnection(async (wxId: string, snsId: string) => {
           const r = deleteSns(wxId, snsId);
-          console.log(r.success ? `✅ 删除朋友圈已发送: ${snsId}` : `❌ ${r.error}`);
+          if (!r.success) { console.log(`❌ ${r.error}`); return; }
+          if (!r.taskId) { console.log(`✅ 删除朋友圈已发送: ${snsId}`); return; }
+          const tr = await awaitTaskResult(wxId, r.taskId, 8000);
+          if (!tr) {
+            console.log(`❌ 8s 内 SDK 没回 — 不能算成功! 不要重发. 用 wework my-moments ${wxId} 复查列表.`);
+            return;
+          }
+          if (tr.success) console.log(`✅ 朋友圈已删除: ${snsId} (taskId=${r.taskId})`);
+          else console.log(`❌ 删除失败: code=${tr.code} ${tr.errMsg || "未知"}`);
         }));
 
       // --- 拉取自己二维码 ---

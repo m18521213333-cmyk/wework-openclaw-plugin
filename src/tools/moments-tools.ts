@@ -15,7 +15,7 @@
 
 import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { clearPostMomentsResult, takePostMomentsResult } from "../services/storage-service.js";
+import { clearPostMomentsResult, takePostMomentsResult, awaitTaskResult } from "../services/storage-service.js";
 import {
   postMoments,
   postMomentsTask,
@@ -36,6 +36,33 @@ function toResult(r: SendResult, ok: string): ToolResult {
     return { content: [{ type: "text" as const, text: ok }], details: {} };
   }
   return { content: [{ type: "text" as const, text: `操作失败: ${r.error}` }], details: {}, isError: true };
+}
+
+/** await TaskResultNotice 真回执 (统一封装, 同 contact-tools / group-tools 模式). */
+async function awaitAndFormat(
+  wxId: string, result: SendResult,
+  successMsg: string, pendingHint: string,
+  timeoutMs = 8000, strict = false,
+): Promise<ToolResult> {
+  if (!result.success || !result.taskId) {
+    return { content: [{ type: "text" as const, text: `操作失败: ${result.error ?? "未知"}` }], details: {}, isError: true };
+  }
+  const r = await awaitTaskResult(wxId, result.taskId, timeoutMs);
+  if (!r) {
+    return {
+      content: [{ type: "text" as const, text: `${strict ? "❌" : "⏳"} ${strict ? "操作未确认" : "操作待确认"}: ${timeoutMs / 1000}s 内手机端无 TaskResultNotice 回执. ${pendingHint}` }],
+      details: {},
+      isError: strict,
+    };
+  }
+  if (r.success) {
+    return { content: [{ type: "text" as const, text: `✅ ${successMsg} (taskId=${result.taskId})` }], details: {} };
+  }
+  return {
+    content: [{ type: "text" as const, text: `❌ 手机端拒绝: code=${r.code} ${r.errMsg || "未知"}` }],
+    details: {},
+    isError: true,
+  };
 }
 
 export function registerMomentsTools(api: OpenClawPluginApi) {
@@ -306,7 +333,13 @@ export function registerMomentsTools(api: OpenClawPluginApi) {
         params.content,
         params.replyTo,
       );
-      return toResult(r, `评论已发送: snsId=${params.snsId}`);
+      // 评论是公开行为, 中性等回 — SDK 也会推 SnsCommentTaskResultNotice (1131)
+      return awaitAndFormat(
+        params.wxId, r,
+        `评论已发送: snsId=${params.snsId}`,
+        `8s 内无回执. 用 wework_get_sns_detail ${params.snsId} 复查评论列表.`,
+        8000, false,
+      );
     },
   }));
 
@@ -316,14 +349,19 @@ export function registerMomentsTools(api: OpenClawPluginApi) {
   // --------------------------------------------------
   api.registerTool(makeTool({
     name: "wework_sns_like",
-    description: "为朋友圈动态点赞",
+    description: "为朋友圈动态点赞 (await TaskResultNotice 真回执)",
     parameters: Type.Object({
       wxId: Type.String({ description: "企业微信ID" }),
       snsId: Type.String({ description: "朋友圈动态ID" }),
     }),
     async execute(_id, params) {
       const r = snsLike(params.wxId, params.snsId);
-      return toResult(r, `点赞已发送: snsId=${params.snsId}`);
+      return awaitAndFormat(
+        params.wxId, r,
+        `点赞已发送: snsId=${params.snsId}`,
+        `8s 内无回执. 用 wework_get_sns_detail ${params.snsId} 复查点赞列表.`,
+        8000, false,
+      );
     },
   }));
 
@@ -333,14 +371,20 @@ export function registerMomentsTools(api: OpenClawPluginApi) {
   // --------------------------------------------------
   api.registerTool(makeTool({
     name: "wework_delete_moments",
-    description: "删除自己发布的朋友圈动态",
+    description: "删除自己发布的朋友圈动态 (不可逆 — await TaskResultNotice 真回执, 超时强否定)",
     parameters: Type.Object({
       wxId: Type.String({ description: "企业微信ID" }),
       snsId: Type.String({ description: "要删除的朋友圈动态ID" }),
     }),
     async execute(_id, params) {
       const r = deleteSns(params.wxId, params.snsId);
-      return toResult(r, `朋友圈删除指令已发送: snsId=${params.snsId}`);
+      // 删除朋友圈不可逆; 超时强否定避免 LLM 重试
+      return awaitAndFormat(
+        params.wxId, r,
+        `朋友圈已删除: snsId=${params.snsId}`,
+        `**不能算成功!** 不要重发. 用 wework_get_my_moments 复查列表.`,
+        8000, true,
+      );
     },
   }));
 
@@ -350,7 +394,7 @@ export function registerMomentsTools(api: OpenClawPluginApi) {
   // --------------------------------------------------
   api.registerTool(makeTool({
     name: "wework_delete_sns_comment",
-    description: "删除朋友圈下的某条评论",
+    description: "删除朋友圈下的某条评论 (await TaskResultNotice 真回执)",
     parameters: Type.Object({
       wxId: Type.String({ description: "企业微信ID" }),
       snsId: Type.String({ description: "朋友圈动态ID" }),
@@ -358,9 +402,11 @@ export function registerMomentsTools(api: OpenClawPluginApi) {
     }),
     async execute(_id, params) {
       const r = deleteSnsComment(params.wxId, params.snsId, params.commentId);
-      return toResult(
-        r,
-        `评论删除指令已发送: snsId=${params.snsId}, commentId=${params.commentId}`,
+      return awaitAndFormat(
+        params.wxId, r,
+        `评论已删除: snsId=${params.snsId}, commentId=${params.commentId}`,
+        `8s 内无回执. 用 wework_get_sns_detail ${params.snsId} 复查评论列表.`,
+        8000, false,
       );
     },
   }));
