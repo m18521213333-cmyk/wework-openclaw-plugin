@@ -89,9 +89,9 @@ export function registerMomentsTools(api: OpenClawPluginApi) {
       if (!r.success) {
         return { content: [{ type: "text" as const, text: `朋友圈发布失败: ${r.error}` }], details: {}, isError: true };
       }
-      // await 真回执 (PostSnsTaskResultNotice WS push), 最长等 10s
+      // await 真回执 (PostSnsTaskResultNotice WS push), 最长等 20s (实测 Java 推 push 8-15s)
       const start = Date.now();
-      while (Date.now() - start < 10_000) {
+      while (Date.now() - start < 20_000) {
         const result = takePostMomentsResult(params.wxId);
         if (result) {
           if (result.success) {

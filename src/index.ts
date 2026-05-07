@@ -41,7 +41,7 @@ import { startAgentBackend } from "./services/agent-backend.js";
 import type { LLMProviderConfig } from "./services/llm-provider.js";
 import type { Server as HttpServer } from "node:http";
 import { handleAiCommand } from "./services/ai-command.js";
-import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getResolvedMediaStatus, clearResolvedMediaRecord, isTransientResolveError, getMessageMeta, upsertMoment, listMoments, getMomentBySnsId, upsertMomentsTask, listMomentsTasks, upsertQrcode, recordPostMomentsResult } from "./services/storage-service.js";
+import { listPhoneStatusEvents, findContactsByName, listContacts, countContacts, getLastMediaFromSender, getRecentMediaFromSender, recordResolvedMediaUrl, getResolvedMediaUrl, getResolvedMediaStatus, clearResolvedMediaRecord, isTransientResolveError, getMessageMeta, upsertMoment, listMoments, getMomentBySnsId, upsertMomentsTask, listMomentsTasks, upsertQrcode, recordPostMomentsResult, recordSendMessageResult, clearSendMessageResult, takeSendMessageResult, clearPostMomentsResult, takePostMomentsResult } from "./services/storage-service.js";
 
 // send-helper (CLI 直接调用)
 // 子进程模式下 Java pluginbot-cli 经常被互踢, 所有 send 路径都走 withRetry 版.
@@ -359,6 +359,21 @@ export default definePluginEntry({
               if (wxId) {
                 recordPostMomentsResult(wxId, success, errMsg);
                 logger.info(`[Moments] ${msgType} 回执: wxId=${wxId} success=${success} errMsg=${errMsg.slice(0, 80)}`);
+              }
+            }
+
+            // 1对1 / 群消息 发送回执 (TalkToFriendTaskResultNotice)
+            // 解决 send_message 假成功: 工具 await 这个 push, 没收到 / Success=false 报失败
+            if (msgType === "TalkToFriendTaskResultNotice") {
+              const wxId = String(content.WxId ?? (content as any).wxId ?? "");
+              const convId = String(content.ConvId ?? (content as any).convId ?? "");
+              const success = (content.Success ?? (content as any).success) === true;
+              const code = Number(content.Code ?? (content as any).code ?? 0);
+              const errMsg = String(content.ErrMsg ?? (content as any).errMsg ?? "");
+              const msgId = String(content.MsgId ?? (content as any).msgId ?? "");
+              if (wxId && convId) {
+                recordSendMessageResult(wxId, convId, success, errMsg, code, msgId);
+                logger.info(`[Send] TalkToFriendTaskResultNotice: wxId=${wxId} convId=${convId} success=${success} code=${code} err=${errMsg.slice(0, 60)}`);
               }
             }
 
@@ -1087,13 +1102,35 @@ export default definePluginEntry({
               return;
             }
           }
+          // 清旧回执
+          clearSendMessageResult(wxId, convId);
           const r = await sendMessageWithRetry(wxId, convId, message, opts.type, undefined, {
             attempts: 4, waitForConnectMs: 15000,
             onAttempt: (n, info) => {
               if (n > 1 || !info.connected) console.log(`[retry] 第 ${n} 次尝试 (connected=${info.connected}${info.lastError ? ", err=" + info.lastError : ""})`);
             },
           });
-          console.log(r.success ? `✅ 消息已发送 → ${convId}` : `❌ ${r.error}`);
+          if (!r.success) {
+            console.log(`❌ ${r.error}`);
+            return;
+          }
+          // await TalkToFriendTaskResultNotice 真回执 (15s — 媒体类型 SDK 上传慢)
+          const start = Date.now();
+          let receipt: ReturnType<typeof takeSendMessageResult> = null;
+          while (Date.now() - start < 15_000) {
+            receipt = takeSendMessageResult(wxId, convId);
+            if (receipt) break;
+            await new Promise((rr) => setTimeout(rr, 400));
+          }
+          if (!receipt) {
+            console.log(`❌ 消息发送未确认: 15s 内手机端无回执 (TalkToFriendTaskResultNotice). 大概率手机离线 / SDK 卡 / 媒体上传太慢.`);
+            return;
+          }
+          if (receipt.success) {
+            console.log(`✅ 消息已确认送达 → ${convId} (msgId=${receipt.msgId || "?"})`);
+          } else {
+            console.log(`❌ 消息发送失败 (手机端拒绝): code=${receipt.code} ${receipt.errMsg || "未知"}`);
+          }
         }));
 
       // --- 搜索消息 ---
@@ -1167,15 +1204,42 @@ export default definePluginEntry({
 
       // --- 群发 --- (走重试: 同 send 命令理由)
       ww.command("mass-send")
-        .description("群发消息")
+        .description("群发消息 (逐条 await 回执)")
         .argument("<wxId>", "企业微信ID")
         .argument("<message>", "消息内容")
         .option("-t, --type <type>", "消息类型", "text")
         .option("--to <ids...>", "目标会话ID列表")
         .action(withConnection(async (wxId: string, message: string, opts: { type: string; to: string[] }) => {
           if (!opts.to?.length) { console.log("❌ 请指定 --to <会话ID列表>"); return; }
-          const r = await massSendWithRetry(wxId, opts.to, message, opts.type);
-          console.log(r.success ? `✅ 群发 → ${opts.to.length} 个会话` : `❌ ${r.error}`);
+          const results: { convId: string; ok: boolean; msg: string }[] = [];
+          for (const convId of opts.to) {
+            clearSendMessageResult(wxId, convId);
+            const sendR = await sendMessageWithRetry(wxId, convId, message, opts.type, undefined, { attempts: 3, waitForConnectMs: 8000 });
+            if (!sendR.success) {
+              results.push({ convId, ok: false, msg: sendR.error ?? "send 失败" });
+              continue;
+            }
+            // await 单条回执 6s
+            const start = Date.now();
+            let receipt: ReturnType<typeof takeSendMessageResult> = null;
+            while (Date.now() - start < 15_000) {
+              receipt = takeSendMessageResult(wxId, convId);
+              if (receipt) break;
+              await new Promise((rr) => setTimeout(rr, 300));
+            }
+            if (!receipt) {
+              results.push({ convId, ok: false, msg: "回执超时" });
+            } else if (receipt.success) {
+              results.push({ convId, ok: true, msg: `msgId=${receipt.msgId || "?"}` });
+            } else {
+              results.push({ convId, ok: false, msg: `code=${receipt.code} ${receipt.errMsg || ""}` });
+            }
+          }
+          const ok = results.filter(r => r.ok).length;
+          console.log(`群发完成: ${ok}/${results.length} 确认送达`);
+          for (const r of results) {
+            console.log(`  ${r.ok ? "✅" : "❌"} ${r.convId}: ${r.msg}`);
+          }
         }));
 
       // --- 群聊操作 ---
@@ -1219,14 +1283,32 @@ export default definePluginEntry({
 
       // --- 发朋友圈 ---
       ww.command("moments")
-        .description("发布朋友圈")
+        .description("发布朋友圈 (await PostSnsTaskResultNotice 真回执)")
         .argument("<wxId>", "企业微信ID")
         .argument("<content>", "文字内容")
         .option("-t, --type <type>", "类型: text/image/video/link", "text")
         .option("--media <urls...>", "图片/视频URL")
         .action(withConnection(async (wxId: string, content: string, opts: { type: string; media?: string[] }) => {
+          clearPostMomentsResult(wxId);
           const r = await postMomentsWithRetry(wxId, content, opts.type, opts.media);
-          console.log(r.success ? "✅ 朋友圈发布指令已发送" : `❌ ${r.error}`);
+          if (!r.success) { console.log(`❌ ${r.error}`); return; }
+          // await 真回执 20s (朋友圈手机端处理较慢, 实测 Java 推 push 8-15s)
+          const start = Date.now();
+          let receipt: ReturnType<typeof takePostMomentsResult> = null;
+          while (Date.now() - start < 20_000) {
+            receipt = takePostMomentsResult(wxId);
+            if (receipt) break;
+            await new Promise((rr) => setTimeout(rr, 400));
+          }
+          if (!receipt) {
+            console.log("❌ 朋友圈未确认: 20s 内无 PostSnsTaskResultNotice 回执. 大概率手机离线 / SDK 卡. 不能算成功.");
+            return;
+          }
+          if (receipt.success) {
+            console.log(`✅ 朋友圈发布成功 (用时 ${Math.round((Date.now() - start) / 100) / 10}s)`);
+          } else {
+            console.log(`❌ 朋友圈发布失败: ${receipt.errMsg || "未知"}`);
+          }
         }));
 
       // --- 查看朋友圈 ---

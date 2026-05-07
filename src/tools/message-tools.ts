@@ -32,6 +32,7 @@ import {
 } from "../services/send-helper.js";
 import type { SendResult } from "../services/send-helper.js";
 import { makeTool, type ToolResult } from "../openclaw-compat.js";
+import { clearSendMessageResult, takeSendMessageResult } from "../services/storage-service.js";
 
 /** 把 SendResult 转为 OpenClaw Tool 的标准返回格式 */
 function toToolResult(result: SendResult, successMsg: string): ToolResult {
@@ -92,6 +93,8 @@ export function registerMessageTools(api: OpenClawPluginApi) {
       ),
     }),
     async execute(_id, params) {
+      // 清旧回执 + 发指令
+      clearSendMessageResult(params.wxId, params.convId);
       const result = sendMessage(
         params.wxId,
         params.convId,
@@ -99,12 +102,44 @@ export function registerMessageTools(api: OpenClawPluginApi) {
         params.contentType ?? "text",
         params.atList,
       );
-
-      const typeLabel = params.contentType ?? "text";
-      return toToolResult(
-        result,
-        `消息已发送到会话 ${params.convId}（类型: ${typeLabel}）`,
-      );
+      if (!result.success) {
+        return { content: [{ type: "text" as const, text: `消息发送失败: ${result.error}` }], details: {}, isError: true };
+      }
+      // await TalkToFriendTaskResultNotice 真回执 (最长 8s)
+      // 解决 fire-and-forget 假成功: 手机离线 / SDK 拒收 时 plugin 也得知道
+      const start = Date.now();
+      while (Date.now() - start < 15_000) {
+        const r = takeSendMessageResult(params.wxId, params.convId);
+        if (r) {
+          if (r.success) {
+            return {
+              content: [{
+                type: "text" as const,
+                text: `✅ 消息已确认送达 → ${params.convId} (msgId=${r.msgId || "?"}, ${Math.round((Date.now() - start) / 100) / 10}s)`,
+              }],
+              details: {},
+            };
+          }
+          return {
+            content: [{
+              type: "text" as const,
+              text: `❌ 消息发送失败 (手机端拒绝): code=${r.code} ${r.errMsg || "未知"}`,
+            }],
+            details: {},
+            isError: true,
+          };
+        }
+        await new Promise((rr) => setTimeout(rr, 400));
+      }
+      // 8s 超时无回执 — 大概率手机离线 / SDK 卡, 必须 isError 强否定防 LLM 美化
+      return {
+        content: [{
+          type: "text" as const,
+          text: `❌ 消息发送未确认: 15s 内手机端无回执 (TalkToFriendTaskResultNotice). 不能算成功! 大概率手机离线或 SDK 卡 / 媒体上传慢. 用户应先看 wework_phone_status 确认手机在线再发. **不要美化结果**`,
+        }],
+        details: {},
+        isError: true,
+      };
     },
   }));
 

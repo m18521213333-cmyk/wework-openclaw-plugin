@@ -734,32 +734,116 @@ export function getMessageMeta(wxId: string, msgId: string): any | null {
 }
 
 // ============================================================================
-// 朋友圈发布结果 — 内存 map (PostSnsTaskResultNotice 异步回执)
-// 由 plugin server WS handler 写, tool execute await 后读.
-// 简单 wxId 为 key (单账号同时发多条朋友圈是边界情况, 不优化).
+// 朋友圈发布结果 — SQLite 持久 (PostSnsTaskResultNotice 异步回执).
+// 跨进程 IPC: plugin server 进程写, CLI 子进程读 — 必须用 SQLite, in-memory Map 行不通.
 // ============================================================================
 export interface PostMomentsResult {
   success: boolean;
   errMsg?: string;
-  ts: number;  // 收到回执的时间
+  ts: number;
 }
-const postMomentsResults = new Map<string, PostMomentsResult>();
 
-/** WS handler 写入 (PostSnsTaskResultNotice) */
+function ensurePostResultsTable() {
+  const db = getDb();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS post_moments_results (
+      wx_id TEXT PRIMARY KEY,
+      success INTEGER NOT NULL,
+      err_msg TEXT,
+      ts INTEGER NOT NULL
+    );
+  `);
+}
+ensurePostResultsTable();
+
+/** WS handler 写入 (PostSnsTaskResultNotice) — plugin server 进程 */
 export function recordPostMomentsResult(wxId: string, success: boolean, errMsg?: string): void {
-  postMomentsResults.set(wxId, { success, errMsg, ts: Date.now() });
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO post_moments_results (wx_id, success, err_msg, ts) VALUES (?, ?, ?, ?)
+    ON CONFLICT(wx_id) DO UPDATE SET success=excluded.success, err_msg=excluded.err_msg, ts=excluded.ts
+  `).run(wxId, success ? 1 : 0, errMsg ?? null, Date.now());
 }
 
-/** tool 读取并清掉 (拿一次就消费) */
+/** tool/CLI 读取并清掉 */
 export function takePostMomentsResult(wxId: string): PostMomentsResult | null {
-  const r = postMomentsResults.get(wxId);
-  if (r) postMomentsResults.delete(wxId);
-  return r ?? null;
+  const db = getDb();
+  const row = db.prepare(`SELECT success, err_msg, ts FROM post_moments_results WHERE wx_id=?`).get(wxId) as any;
+  if (!row) return null;
+  db.prepare(`DELETE FROM post_moments_results WHERE wx_id=?`).run(wxId);
+  return { success: row.success === 1, errMsg: row.err_msg ?? undefined, ts: row.ts };
 }
 
-/** tool 调发布前先清旧的 (防止上一次留下的结果污染) */
+/** 发布前清旧 */
 export function clearPostMomentsResult(wxId: string): void {
-  postMomentsResults.delete(wxId);
+  const db = getDb();
+  db.prepare(`DELETE FROM post_moments_results WHERE wx_id=?`).run(wxId);
+}
+
+// ============================================================================
+// 1对1 / 群消息 发送回执 — SQLite 持久 (TalkToFriendTaskResultNotice WS push)
+// 关键: plugin server 进程写, CLI 子进程读 — 必须用 SQLite 跨进程 IPC.
+// 用内存 Map 会失败 (子进程读不到 server 内存).
+// ============================================================================
+export interface SendMessageResult {
+  success: boolean;
+  errMsg?: string;
+  code?: number;
+  msgId?: string;
+  ts: number;
+}
+
+function ensureSendResultsTable() {
+  const db = getDb();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS send_message_results (
+      wx_id TEXT NOT NULL,
+      conv_id TEXT NOT NULL,
+      success INTEGER NOT NULL,
+      err_msg TEXT,
+      code INTEGER,
+      msg_id TEXT,
+      ts INTEGER NOT NULL,
+      PRIMARY KEY (wx_id, conv_id)
+    );
+  `);
+}
+ensureSendResultsTable();
+
+/** WS handler 写入 (TalkToFriendTaskResultNotice) — plugin server 进程 */
+export function recordSendMessageResult(wxId: string, convId: string, success: boolean, errMsg?: string, code?: number, msgId?: string): void {
+  const db = getDb();
+  db.prepare(`
+    INSERT INTO send_message_results (wx_id, conv_id, success, err_msg, code, msg_id, ts)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(wx_id, conv_id) DO UPDATE SET
+      success=excluded.success, err_msg=excluded.err_msg, code=excluded.code,
+      msg_id=excluded.msg_id, ts=excluded.ts
+  `).run(wxId, convId, success ? 1 : 0, errMsg ?? null, code ?? null, msgId ?? null, Date.now());
+}
+
+/** tool/CLI 读取并清掉 (一次消费) */
+export function takeSendMessageResult(wxId: string, convId: string): SendMessageResult | null {
+  const db = getDb();
+  const row = db.prepare(`
+    SELECT success, err_msg, code, msg_id, ts FROM send_message_results
+    WHERE wx_id=? AND conv_id=?
+  `).get(wxId, convId) as any;
+  if (!row) return null;
+  db.prepare(`DELETE FROM send_message_results WHERE wx_id=? AND conv_id=?`).run(wxId, convId);
+  return {
+    success: row.success === 1,
+    errMsg: row.err_msg ?? undefined,
+    code: row.code ?? undefined,
+    msgId: row.msg_id ?? undefined,
+    ts: row.ts,
+  };
+}
+
+/** 发送前清旧 */
+export function clearSendMessageResult(wxId: string, convId: string): void {
+  const db = getDb();
+  db.prepare(`DELETE FROM send_message_results WHERE wx_id=? AND conv_id=?`).run(wxId, convId);
 }
 
 /**
